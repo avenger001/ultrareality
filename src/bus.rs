@@ -72,10 +72,11 @@ impl Bus for PhysicalMemory {
     }
 }
 
-/// Map CPU virtual address to physical (direct segments; **TLB not implemented**).
+/// Map CPU virtual address to physical **without** the TLB (bootstrap / PI helpers only).
 ///
 /// `kseg0` / `kseg1` (`0x80000000`–`0xBFFFFFFF`): physical = `vaddr & 0x1FFF_FFFF`.
-/// `kuseg` low (`0x00000000`–`0x7FFFFFFF`): identity-mapped physical for bring-up.
+/// `kuseg` (`0x00000000`–`0x7FFFFFFF`): identity-mapped for DMA / loaders — **CPU** accesses use
+/// [`crate::cpu::cop0::Cop0::translate_virt`].
 #[inline]
 pub fn virt_to_phys(vaddr: u64) -> Option<u32> {
     let v = vaddr as u32;
