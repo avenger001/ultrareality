@@ -41,6 +41,7 @@ impl Machine {
         let def = self.bus.drain_deferred_cycles();
         let delta = c.saturating_add(def);
         self.master_cycles = self.master_cycles.wrapping_add(delta);
+        self.cpu.cop0.advance_count_wrapped(delta);
         self.bus.advance_vi_frame_timing(delta);
         Ok(())
     }
@@ -53,6 +54,7 @@ impl Machine {
             let def = self.bus.drain_deferred_cycles();
             let delta = c.saturating_add(def);
             self.master_cycles = self.master_cycles.wrapping_add(delta);
+            self.cpu.cop0.advance_count_wrapped(delta);
             self.bus.advance_vi_frame_timing(delta);
         }
         Ok(())

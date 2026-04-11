@@ -15,6 +15,10 @@ pub const CAUSE_EXCCODE_MASK: u32 = 0x1F;
 
 /// Exception code: interrupt.
 pub const EXCCODE_INT: u32 = 0;
+/// Exception code: system call (`SYSCALL`).
+pub const EXCCODE_SYSCALL: u32 = 8;
+/// Exception code: breakpoint (`BREAK`).
+pub const EXCCODE_BP: u32 = 9;
 
 #[derive(Clone, Debug)]
 pub struct Cop0 {
@@ -60,12 +64,32 @@ impl Cop0 {
         }
     }
 
+    /// General exception vector (TLB refill / mod / `SYSCALL` / `BREAK` / …): same base as interrupts.
+    #[inline]
+    pub fn general_exception_vector(&self) -> u64 {
+        self.interrupt_vector()
+    }
+
     /// Record an interrupt exception before redirecting `PC` (caller sets `pc`).
     pub fn enter_interrupt_exception(&mut self, epc: u64) {
         self.epc = epc;
         self.cause = (self.cause & !(CAUSE_EXCCODE_MASK << CAUSE_EXCCODE_SHIFT))
             | (EXCCODE_INT << CAUSE_EXCCODE_SHIFT);
         self.status |= STATUS_EXL;
+    }
+
+    /// Synchronous exception (`SYSCALL`, `BREAK`, trap, …): sets `EPC`, `Cause.ExcCode`, `Status.EXL`.
+    pub fn enter_general_exception(&mut self, epc: u64, exccode: u32) {
+        self.epc = epc;
+        self.cause = (self.cause & !(CAUSE_EXCCODE_MASK << CAUSE_EXCCODE_SHIFT))
+            | ((exccode & CAUSE_EXCCODE_MASK) << CAUSE_EXCCODE_SHIFT);
+        self.status |= STATUS_EXL;
+    }
+
+    /// Advance `Count` (CP0 r9) with wrapping; tied to the master cycle counter between instructions.
+    #[inline]
+    pub fn advance_count_wrapped(&mut self, delta: u64) {
+        self.count = self.count.wrapping_add(delta as u32);
     }
 
     /// `ERET` return path (caller assigns `self.pc`).
@@ -83,7 +107,9 @@ impl Cop0 {
     pub fn read_32(&self, reg: u32) -> u32 {
         match reg {
             8 => self.badvaddr as u32,
-            9 => (self.badvaddr >> 32) as u32,
+            // CP0 r9 — Count (not high half of BadVAddr; use `DMFC0` / 64-bit paths for full BadVAddr).
+            9 => self.count,
+            10 => 0,
             11 => self.compare,
             12 => self.status,
             13 => self.cause,
@@ -100,6 +126,7 @@ impl Cop0 {
 
     pub fn write_32(&mut self, reg: u32, value: u32) {
         match reg {
+            9 => self.count = value,
             11 => self.compare = value,
             12 => self.status = value,
             13 => self.cause = value,

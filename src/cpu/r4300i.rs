@@ -1,4 +1,4 @@
-use super::cop0::Cop0;
+use super::cop0::{Cop0, EXCCODE_BP, EXCCODE_SYSCALL};
 use super::cop1::{
     cond_f32, cond_f64, f32_to_i32_ceil, f32_to_i32_floor, f32_to_i32_rm, f32_to_i32_trunc,
     f32_to_i64_rm, f64_to_i32_ceil, f64_to_i32_floor, f64_to_i32_rm, f64_to_i32_trunc,
@@ -265,7 +265,11 @@ impl R4300i {
 
         let delay_pc = pc.wrapping_add(4);
         let delay_word = self.fetch32(bus, delay_pc)?;
-        cycles += self.exec_non_branch(delay_pc, delay_word, bus)?;
+        let d = self.exec_non_branch(delay_pc, delay_word, bus)?;
+        cycles += d;
+        if d == cycles::EXCEPTION {
+            return Ok(cycles);
+        }
         self.pc = target;
         Ok(cycles)
     }
@@ -301,7 +305,11 @@ impl R4300i {
         let delay_pc = pc.wrapping_add(4);
         let delay_word = self.fetch32(bus, delay_pc)?;
         let mut cycles = cycles::BRANCH;
-        cycles += self.exec_non_branch(delay_pc, delay_word, bus)?;
+        let d = self.exec_non_branch(delay_pc, delay_word, bus)?;
+        cycles += d;
+        if d == cycles::EXCEPTION {
+            return Ok(cycles);
+        }
 
         self.pc = if cond {
             pc.wrapping_add((imm << 2) as u64).wrapping_add(4)
@@ -330,7 +338,11 @@ impl R4300i {
                 let mut cycles = cycles::BRANCH;
                 let delay_pc = pc.wrapping_add(4);
                 let delay_word = self.fetch32(bus, delay_pc)?;
-                cycles += self.exec_non_branch(delay_pc, delay_word, bus)?;
+                let d = self.exec_non_branch(delay_pc, delay_word, bus)?;
+                cycles += d;
+                if d == cycles::EXCEPTION {
+                    return Ok(cycles);
+                }
                 self.pc = target;
                 Ok(cycles)
             }
@@ -341,9 +353,25 @@ impl R4300i {
                 let mut cycles = cycles::BRANCH;
                 let delay_pc = pc.wrapping_add(4);
                 let delay_word = self.fetch32(bus, delay_pc)?;
-                cycles += self.exec_non_branch(delay_pc, delay_word, bus)?;
+                let d = self.exec_non_branch(delay_pc, delay_word, bus)?;
+                cycles += d;
+                if d == cycles::EXCEPTION {
+                    return Ok(cycles);
+                }
                 self.pc = target;
                 Ok(cycles)
+            }
+            0x0C => {
+                let v = self.cop0.general_exception_vector();
+                self.cop0.enter_general_exception(pc, EXCCODE_SYSCALL);
+                self.pc = v;
+                Ok(cycles::EXCEPTION)
+            }
+            0x0D => {
+                let v = self.cop0.general_exception_vector();
+                self.cop0.enter_general_exception(pc, EXCCODE_BP);
+                self.pc = v;
+                Ok(cycles::EXCEPTION)
             }
             _ => {
                 let c = self.exec_non_branch(pc, word, bus)?;
@@ -403,7 +431,11 @@ impl R4300i {
         let delay_pc = pc.wrapping_add(4);
         let delay_word = self.fetch32(bus, delay_pc)?;
         let mut cycles = cycles::BRANCH;
-        cycles += self.exec_non_branch(delay_pc, delay_word, bus)?;
+        let d = self.exec_non_branch(delay_pc, delay_word, bus)?;
+        cycles += d;
+        if d == cycles::EXCEPTION {
+            return Ok(cycles);
+        }
         self.pc = pc.wrapping_add(imm as u64).wrapping_add(4);
         Ok(cycles)
     }
@@ -435,7 +467,11 @@ impl R4300i {
 
         let delay_pc = pc.wrapping_add(4);
         let delay_word = self.fetch32(bus, delay_pc)?;
-        cycles += self.exec_non_branch(delay_pc, delay_word, bus)?;
+        let d = self.exec_non_branch(delay_pc, delay_word, bus)?;
+        cycles += d;
+        if d == cycles::EXCEPTION {
+            return Ok(cycles);
+        }
 
         self.pc = if take {
             pc.wrapping_add(imm as u64).wrapping_add(4)
@@ -588,12 +624,16 @@ impl R4300i {
                         Ok(cycles::ALU)
                     }
                     0x0C => {
-                        // SYSCALL — no exception delivery model yet; no-op for bring-up.
-                        Ok(cycles::ALU)
+                        let v = self.cop0.general_exception_vector();
+                        self.cop0.enter_general_exception(pc, EXCCODE_SYSCALL);
+                        self.pc = v;
+                        Ok(cycles::EXCEPTION)
                     }
                     0x0D => {
-                        // BREAK — no debugger; no-op for bring-up.
-                        Ok(cycles::ALU)
+                        let v = self.cop0.general_exception_vector();
+                        self.cop0.enter_general_exception(pc, EXCCODE_BP);
+                        self.pc = v;
+                        Ok(cycles::EXCEPTION)
                     }
                     0x14 => {
                         // DSLLV
@@ -1253,7 +1293,11 @@ impl R4300i {
         let delay_pc = pc.wrapping_add(4);
         let delay_word = self.fetch32(bus, delay_pc)?;
         let mut cycles = cycles::BRANCH;
-        cycles += self.exec_non_branch(delay_pc, delay_word, bus)?;
+        let d = self.exec_non_branch(delay_pc, delay_word, bus)?;
+        cycles += d;
+        if d == cycles::EXCEPTION {
+            return Ok(cycles);
+        }
 
         self.pc = if take {
             pc.wrapping_add(imm as u64).wrapping_add(4)
@@ -1353,17 +1397,35 @@ mod tests {
     }
 
     #[test]
-    fn syscall_and_break_special_no_halt() {
+    fn syscall_and_break_general_exception() {
+        use crate::cpu::cop0::{
+            CAUSE_EXCCODE_MASK, CAUSE_EXCCODE_SHIFT, EXCCODE_BP, EXCCODE_SYSCALL, STATUS_BEV,
+            STATUS_EXL,
+        };
+
         let mut cpu = R4300i::new();
         cpu.reset(0x8000_0000);
+        cpu.cop0.status &= !STATUS_BEV;
         let mut mem = PhysicalMemory::new(1024 * 1024);
         // SPECIAL + SYSCALL (funct 0x0C)
         write_be32(&mut mem, 0, 0x0000_000C);
+        assert_eq!(cpu.step(&mut mem, false).unwrap(), cycles::EXCEPTION);
+        assert_eq!(cpu.pc, 0xFFFF_FFFF_8000_0180);
+        assert_eq!(cpu.cop0.epc, 0x8000_0000);
+        assert!((cpu.cop0.status & STATUS_EXL) != 0);
+        let exc = (cpu.cop0.cause >> CAUSE_EXCCODE_SHIFT) & CAUSE_EXCCODE_MASK;
+        assert_eq!(exc, EXCCODE_SYSCALL);
+
+        // Handler at vector: nop, then re-run at next PC with BREAK
+        write_be32(&mut mem, 0x180, 0x0000_0000);
+        write_be32(&mut mem, 0x184, 0x0000_000D);
+        cpu.cop0.status &= !STATUS_EXL;
+        cpu.pc = 0xFFFF_FFFF_8000_0180;
         assert_eq!(cpu.step(&mut mem, false).unwrap(), cycles::ALU);
-        assert_eq!(cpu.pc, 0x8000_0004);
-        // SPECIAL + BREAK (funct 0x0D)
-        write_be32(&mut mem, 4, 0x0000_000D);
-        assert_eq!(cpu.step(&mut mem, false).unwrap(), cycles::ALU);
-        assert_eq!(cpu.pc, 0x8000_0008);
+        assert_eq!(cpu.pc, 0xFFFF_FFFF_8000_0184);
+        assert_eq!(cpu.step(&mut mem, false).unwrap(), cycles::EXCEPTION);
+        assert_eq!(cpu.cop0.epc, 0xFFFF_FFFF_8000_0184);
+        let exc2 = (cpu.cop0.cause >> CAUSE_EXCCODE_SHIFT) & CAUSE_EXCCODE_MASK;
+        assert_eq!(exc2, EXCCODE_BP);
     }
 }

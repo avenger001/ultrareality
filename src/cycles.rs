@@ -27,3 +27,6 @@ pub const COP_MOVE: u64 = 1;
 
 /// External interrupt exception taken (RCP / MI line).
 pub const INTERRUPT: u64 = 2;
+
+/// Synchronous general exception (`SYSCALL`, `BREAK`, …) until pipeline timing is modeled.
+pub const EXCEPTION: u64 = INTERRUPT;
