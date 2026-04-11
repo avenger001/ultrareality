@@ -38,10 +38,10 @@ impl Machine {
     pub fn step(&mut self) -> Result<(), CpuHalt> {
         let irq = self.bus.mi.cpu_irq_pending();
         let c = self.cpu.step(&mut self.bus, irq)?;
-        self.master_cycles = self.master_cycles.wrapping_add(c);
-        self.master_cycles = self
-            .master_cycles
-            .wrapping_add(self.bus.drain_deferred_cycles());
+        let def = self.bus.drain_deferred_cycles();
+        let delta = c.saturating_add(def);
+        self.master_cycles = self.master_cycles.wrapping_add(delta);
+        self.bus.advance_vi_frame_timing(delta);
         Ok(())
     }
 
@@ -50,10 +50,10 @@ impl Machine {
         for _ in 0..max_steps {
             let irq = self.bus.mi.cpu_irq_pending();
             let c = self.cpu.step(&mut self.bus, irq)?;
-            self.master_cycles = self.master_cycles.wrapping_add(c);
-            self.master_cycles = self
-                .master_cycles
-                .wrapping_add(self.bus.drain_deferred_cycles());
+            let def = self.bus.drain_deferred_cycles();
+            let delta = c.saturating_add(def);
+            self.master_cycles = self.master_cycles.wrapping_add(delta);
+            self.bus.advance_vi_frame_timing(delta);
         }
         Ok(())
     }

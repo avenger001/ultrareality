@@ -150,6 +150,11 @@ impl SystemBus {
         self.drain_pi_cycles().saturating_add(self.si.drain_cycles())
     }
 
+    /// NTSC VI line: accumulate cycles and raise `MI_INTR_VI` each frame (stub).
+    pub fn advance_vi_frame_timing(&mut self, cycles: u64) {
+        self.vi.advance(cycles, &mut self.mi);
+    }
+
     #[inline]
     fn rdram_len_u32(&self) -> u32 {
         self.rdram.data.len() as u32

@@ -258,7 +258,9 @@ impl R4300i {
             }
             _ => {
                 let c = self.exec_non_branch(pc, word, bus)?;
-                self.pc = pc.wrapping_add(4);
+                if !Self::is_eret(word) {
+                    self.pc = pc.wrapping_add(4);
+                }
                 Ok(c)
             }
         }
@@ -275,10 +277,17 @@ impl R4300i {
             0x04 | 0x05 | 0x06 | 0x07 => self.exec_branch(pc, word, bus, op),
             _ => {
                 let c = self.exec_non_branch(pc, word, bus)?;
-                self.pc = pc.wrapping_add(4);
+                if !Self::is_eret(word) {
+                    self.pc = pc.wrapping_add(4);
+                }
                 Ok(c)
             }
         }
+    }
+
+    #[inline]
+    fn is_eret(word: u32) -> bool {
+        word >> 26 == 0x10 && (word >> 21) & 0x1F == 0x10 && word & 0x3F == 0x18
     }
 
     fn exec_branch(
@@ -532,6 +541,13 @@ impl R4300i {
             }
             0x10 => {
                 let sub = (word >> 21) & 0x1F;
+                let funct = word & 0x3F;
+                // `ERET` — COP0, cofun 0x18 (e.g. `0x4200_0018`).
+                if sub == 0x10 && funct == 0x18 {
+                    self.pc = self.cop0.apply_eret();
+                    self.ll_bit = false;
+                    return Ok(cycles::ALU);
+                }
                 let rd_cop = ((word >> 11) & 0x1F) as u32;
                 match sub {
                     0x00 => {
@@ -620,5 +636,23 @@ mod tests {
         cpu.step(&mut mem, false).unwrap();
         assert_eq!(cpu.pc, 0x8000_0020);
         assert_eq!(cpu.regs[31], 0x8000_0008);
+    }
+
+    #[test]
+    fn eret_restores_epc_and_clears_exl() {
+        use crate::cpu::cop0::{STATUS_ERL, STATUS_EXL};
+
+        let mut cpu = R4300i::new();
+        cpu.reset(0xFFFF_FFFF_8000_0180);
+        cpu.cop0.epc = 0xFFFF_FFFF_8000_4000;
+        // Avoid default `ERL` so `ERET` uses `EPC` (not `ErrorEPC`).
+        cpu.cop0.status = (cpu.cop0.status & !STATUS_ERL) | STATUS_EXL;
+
+        let mut mem = PhysicalMemory::new(1024 * 1024);
+        write_be32(&mut mem, 0x180, 0x4200_0018);
+
+        assert_eq!(cpu.step(&mut mem, false).unwrap(), crate::cycles::ALU);
+        assert_eq!(cpu.pc, 0xFFFF_FFFF_8000_4000);
+        assert!((cpu.cop0.status & STATUS_EXL) == 0);
     }
 }

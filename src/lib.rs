@@ -27,4 +27,4 @@ pub use mi::Mi;
 pub use pi::Pi;
 pub use pif::Pif;
 pub use si::Si;
-pub use vi::Vi;
+pub use vi::{Vi, VI_NTSC_CYCLES_PER_FRAME};

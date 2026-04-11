@@ -21,6 +21,8 @@ pub struct Cop0 {
     pub status: u32,
     pub cause: u32,
     pub epc: u64,
+    /// COP0 r30 — error return (ERET when `Status.ERL` is set).
+    pub error_epc: u64,
     pub badvaddr: u64,
     pub compare: u32,
     pub count: u32,
@@ -33,6 +35,7 @@ impl Cop0 {
             status: 0x7040_0004,
             cause: 0,
             epc: 0,
+            error_epc: 0,
             badvaddr: 0,
             compare: 0,
             count: 0,
@@ -65,6 +68,18 @@ impl Cop0 {
         self.status |= STATUS_EXL;
     }
 
+    /// `ERET` return path (caller assigns `self.pc`).
+    #[inline]
+    pub fn apply_eret(&mut self) -> u64 {
+        if (self.status & STATUS_ERL) != 0 {
+            self.status &= !STATUS_ERL;
+            self.error_epc
+        } else {
+            self.status &= !STATUS_EXL;
+            self.epc
+        }
+    }
+
     pub fn read_32(&self, reg: u32) -> u32 {
         match reg {
             8 => self.badvaddr as u32,
@@ -74,6 +89,8 @@ impl Cop0 {
             13 => self.cause,
             14 => self.epc as u32,
             15 => (self.epc >> 32) as u32,
+            30 => self.error_epc as u32,
+            31 => (self.error_epc >> 32) as u32,
             _ => 0,
         }
     }
@@ -85,6 +102,8 @@ impl Cop0 {
             13 => self.cause = value,
             14 => self.epc = (self.epc & !0xFFFF_FFFF) | u64::from(value),
             15 => self.epc = (self.epc & 0xFFFF_FFFF) | (u64::from(value) << 32),
+            30 => self.error_epc = (self.error_epc & !0xFFFF_FFFF) | u64::from(value),
+            31 => self.error_epc = (self.error_epc & 0xFFFF_FFFF) | (u64::from(value) << 32),
             _ => {}
         }
     }
