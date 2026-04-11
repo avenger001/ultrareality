@@ -1,0 +1,16 @@
+[package]
+name = "ultrareality"
+version = "0.1.0"
+edition = "2021"
+description = "Cycle-oriented Nintendo 64 emulation core (R4300i + system bus)"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+
+[[bin]]
+name = "ultrareality"
+path = "src/main.rs"
+
+[lib]
+name = "ultrareality"
+path = "src/lib.rs"

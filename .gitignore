@@ -1,0 +1,7 @@
+/target
+Cargo.lock
+*.pdb
+*.rom
+*.z64
+*.v64
+*.n64
