@@ -1,4 +1,9 @@
 use super::cop0::Cop0;
+use super::cop1::{
+    cond_f32, cond_f64, f32_to_i32_ceil, f32_to_i32_floor, f32_to_i32_rm, f32_to_i32_trunc,
+    f32_to_i64_rm, f64_to_i32_ceil, f64_to_i32_floor, f64_to_i32_rm, f64_to_i32_trunc,
+    f64_to_i64_rm, fcsr_rm, Cop1,
+};
 use crate::bus::{virt_to_phys, Bus};
 use crate::cycles;
 
@@ -15,14 +20,19 @@ pub enum CpuHalt {
 /// Branch and jump instructions execute the architectural delay slot in the
 /// same `step` call (two retired instructions worth of work when a branch is
 /// taken), and cycle counts include both the branch/jump and the delay slot.
+///
+/// **References:** N64 CPU / VR4300 overview — [en64: N64 CPU](https://en64.shoutwiki.com/wiki/N64_CPU);
+/// opcode tables / decoding — [en64: Opcodes](https://en64.shoutwiki.com/wiki/Opcodes) (see also repo `docs/n64-opcodes-reference.md`);
+/// architecture and chip notes — [n64brew: VR4300](https://n64brew.dev/wiki/VR4300).
 pub struct R4300i {
     pub regs: [u64; 32],
     pub hi: u64,
     pub lo: u64,
     pub pc: u64,
     pub cop0: Cop0,
+    pub cop1: Cop1,
     pub ll_bit: bool,
-    pub ll_addr: u32,
+    pub ll_addr: u64,
 }
 
 impl R4300i {
@@ -34,6 +44,7 @@ impl R4300i {
             // Typical IPL entry in kseg1 bootstrap (PI ROM copies to RDRAM first).
             pc: 0xA400_0040,
             cop0: Cop0::new(),
+            cop1: Cop1::new(),
             ll_bit: false,
             ll_addr: 0,
         }
@@ -45,6 +56,7 @@ impl R4300i {
         self.lo = 0;
         self.pc = entry_pc;
         self.cop0 = Cop0::new();
+        self.cop1.reset();
         self.ll_bit = false;
         self.ll_addr = 0;
     }
@@ -87,6 +99,75 @@ impl R4300i {
         }
         let p = virt_to_phys(vaddr).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         bus.write_u32(p, value);
+        Ok(())
+    }
+
+    fn load64(&mut self, bus: &mut impl Bus, vaddr: u64) -> Result<u64, CpuHalt> {
+        if vaddr & 7 != 0 {
+            return Err(CpuHalt::UnalignedAccess { vaddr, width: 8 });
+        }
+        let p = virt_to_phys(vaddr).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
+        let hi = bus.read_u32(p).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
+        let lo = bus
+            .read_u32(p.wrapping_add(4))
+            .ok_or(CpuHalt::UnmappedAddress { vaddr })?;
+        Ok((u64::from(hi) << 32) | u64::from(lo))
+    }
+
+    fn store64(&mut self, bus: &mut impl Bus, vaddr: u64, value: u64) -> Result<(), CpuHalt> {
+        if vaddr & 7 != 0 {
+            return Err(CpuHalt::UnalignedAccess { vaddr, width: 8 });
+        }
+        let p = virt_to_phys(vaddr).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
+        bus.write_u32(p, (value >> 32) as u32);
+        bus.write_u32(p.wrapping_add(4), value as u32);
+        Ok(())
+    }
+
+    /// `LWL` — merge loaded high bytes into `rt` (32-bit result sign-extended to GPR).
+    fn merge_lwl(&self, cur_rt: u64, mem_word: u32, eff: u64) -> u32 {
+        let sh = ((eff & 3) * 8) as u32;
+        let cur = cur_rt as u32;
+        (mem_word << sh) | (cur & ((1u32 << sh).wrapping_sub(1)))
+    }
+
+    /// `LWR` — merge loaded low bytes into `rt`.
+    fn merge_lwr(&self, cur_rt: u64, mem_word: u32, eff: u64) -> u32 {
+        let o = (eff & 3) as u32;
+        let cur = cur_rt as u32;
+        match o {
+            0 => (cur & 0xFFFF_FF00u32) | (mem_word >> 24),
+            1 => (cur & 0xFFFF_0000u32) | (mem_word >> 16),
+            2 => (cur & 0xFF00_0000u32) | (mem_word >> 8),
+            3 => mem_word,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Store word left: high-order bytes of rt from eff through end of aligned word.
+    fn store_swl(&mut self, bus: &mut impl Bus, eff: u64, val: u64) -> Result<(), CpuHalt> {
+        let b = (val as u32).to_be_bytes();
+        let al = eff & !3;
+        let o = (eff & 3) as usize;
+        for i in o..4 {
+            let pa = virt_to_phys(al.wrapping_add(i as u64)).ok_or(CpuHalt::UnmappedAddress { vaddr: al.wrapping_add(i as u64) })?;
+            bus.write_u8(pa, b[i]);
+        }
+        Ok(())
+    }
+
+    /// Store word right: low-order bytes of rt from aligned address through eff.
+    fn store_swr(&mut self, bus: &mut impl Bus, eff: u64, val: u64) -> Result<(), CpuHalt> {
+        let al = eff & !3;
+        let o = (eff & 3) as usize;
+        if o == 0 {
+            return self.store32(bus, eff, val as u32);
+        }
+        let b = (val as u32).to_be_bytes();
+        for j in 0..=o {
+            let pa = virt_to_phys(al.wrapping_add(j as u64)).ok_or(CpuHalt::UnmappedAddress { vaddr: al.wrapping_add(j as u64) })?;
+            bus.write_u8(pa, b[3 - o + j]);
+        }
         Ok(())
     }
 
@@ -144,7 +225,7 @@ impl R4300i {
     /// Execute one **architectural** instruction (including its delay slot for
     /// branches/jumps). Returns CPU cycles consumed for this retirement.
     ///
-    /// `rcp_interrupt`: MI-driven external interrupt line (pending ∧ mask). If
+    /// `rcp_interrupt`: MI-driven external interrupt line (pending and mask). If
     /// [`crate::cpu::cop0::Cop0::interrupts_enabled`], takes exception before fetch.
     pub fn step(&mut self, bus: &mut impl Bus, rcp_interrupt: bool) -> Result<u64, CpuHalt> {
         if rcp_interrupt && self.cop0.interrupts_enabled() {
@@ -195,26 +276,34 @@ impl R4300i {
         word: u32,
         bus: &mut impl Bus,
     ) -> Result<u64, CpuHalt> {
-        let rt = ((word >> 16) & 0x1F) as usize;
+        let rt_field = ((word >> 16) & 0x1F) as usize;
         let rs = ((word >> 21) & 0x1F) as usize;
         let imm = (word & 0xFFFF) as i16 as i64;
-        let mut cycles = cycles::BRANCH;
 
-        let take = match rt {
-            0x00 => (self.gpr(rs) as i64) < 0,
-            0x01 => (self.gpr(rs) as i64) >= 0,
-            0x10 => self.gpr(rs) == 0,
-            0x11 => self.gpr(rs) != 0,
-            _ => {
-                return Err(CpuHalt::UnimplementedOpcode { pc, word });
-            }
+        let cond = match rt_field {
+            0x00 | 0x02 | 0x10 | 0x12 => (self.gpr(rs) as i64) < 0,
+            0x01 | 0x03 | 0x11 | 0x13 => (self.gpr(rs) as i64) >= 0,
+            _ => return Err(CpuHalt::UnimplementedOpcode { pc, word }),
         };
+
+        let likely = matches!(rt_field, 0x02 | 0x03 | 0x12 | 0x13);
+        let link = matches!(rt_field, 0x10 | 0x11 | 0x12 | 0x13);
+
+        if link {
+            self.set_gpr(31, pc.wrapping_add(8));
+        }
+
+        if likely && !cond {
+            self.pc = pc.wrapping_add(8);
+            return Ok(cycles::BRANCH);
+        }
 
         let delay_pc = pc.wrapping_add(4);
         let delay_word = self.fetch32(bus, delay_pc)?;
+        let mut cycles = cycles::BRANCH;
         cycles += self.exec_non_branch(delay_pc, delay_word, bus)?;
 
-        self.pc = if take {
+        self.pc = if cond {
             pc.wrapping_add((imm << 2) as u64).wrapping_add(4)
         } else {
             pc.wrapping_add(8)
@@ -275,6 +364,7 @@ impl R4300i {
     ) -> Result<u64, CpuHalt> {
         match op {
             0x04 | 0x05 | 0x06 | 0x07 => self.exec_branch(pc, word, bus, op),
+            0x14 | 0x15 | 0x16 | 0x17 => self.exec_branch_likely(pc, word, bus, op),
             _ => {
                 let c = self.exec_non_branch(pc, word, bus)?;
                 if !Self::is_eret(word) {
@@ -283,6 +373,39 @@ impl R4300i {
                 Ok(c)
             }
         }
+    }
+
+    /// Branch likely (`BEQL`…`BGTZL`): if not taken, delay slot is **not** executed.
+    fn exec_branch_likely(
+        &mut self,
+        pc: u64,
+        word: u32,
+        bus: &mut impl Bus,
+        op: u32,
+    ) -> Result<u64, CpuHalt> {
+        let rs = ((word >> 21) & 0x1F) as usize;
+        let rt = ((word >> 16) & 0x1F) as usize;
+        let imm = ((word & 0xFFFF) as i16 as i64) << 2;
+
+        let take = match op {
+            0x14 => self.gpr(rs) == self.gpr(rt),
+            0x15 => self.gpr(rs) != self.gpr(rt),
+            0x16 => (self.gpr(rs) as i64) <= 0,
+            0x17 => (self.gpr(rs) as i64) > 0,
+            _ => unreachable!(),
+        };
+
+        if !take {
+            self.pc = pc.wrapping_add(8);
+            return Ok(cycles::BRANCH);
+        }
+
+        let delay_pc = pc.wrapping_add(4);
+        let delay_word = self.fetch32(bus, delay_pc)?;
+        let mut cycles = cycles::BRANCH;
+        cycles += self.exec_non_branch(delay_pc, delay_word, bus)?;
+        self.pc = pc.wrapping_add(imm as u64).wrapping_add(4);
+        Ok(cycles)
     }
 
     #[inline]
@@ -460,10 +583,112 @@ impl R4300i {
                         self.lo = self.gpr(rs);
                         Ok(cycles::ALU)
                     }
+                    0x0F => {
+                        // SYNC — memory barrier; no bus effect in this model.
+                        Ok(cycles::ALU)
+                    }
+                    0x0C => {
+                        // SYSCALL — no exception delivery model yet; no-op for bring-up.
+                        Ok(cycles::ALU)
+                    }
+                    0x0D => {
+                        // BREAK — no debugger; no-op for bring-up.
+                        Ok(cycles::ALU)
+                    }
+                    0x14 => {
+                        // DSLLV
+                        let s = self.gpr(rs) & 0x3F;
+                        self.set_gpr(rd, self.gpr(rt) << s);
+                        Ok(cycles::ALU)
+                    }
+                    0x16 => {
+                        // DSRLV
+                        let s = self.gpr(rs) & 0x3F;
+                        self.set_gpr(rd, self.gpr(rt) >> s);
+                        Ok(cycles::ALU)
+                    }
+                    0x17 => {
+                        // DSRAV
+                        let s = self.gpr(rs) & 0x3F;
+                        self.set_gpr(rd, ((self.gpr(rt) as i64) >> s) as u64);
+                        Ok(cycles::ALU)
+                    }
+                    0x1C => {
+                        let a = self.gpr(rs) as i128;
+                        let b = self.gpr(rt) as i128;
+                        let p = a.wrapping_mul(b);
+                        self.lo = p as u64;
+                        self.hi = (p >> 64) as u64;
+                        Ok(cycles::MULT_LATENCY)
+                    }
+                    0x1D => {
+                        let a = self.gpr(rs) as u128;
+                        let b = self.gpr(rt) as u128;
+                        let p = a.wrapping_mul(b);
+                        self.lo = p as u64;
+                        self.hi = (p >> 64) as u64;
+                        Ok(cycles::MULT_LATENCY)
+                    }
+                    0x1E => {
+                        let s = self.gpr(rs) as i64;
+                        let t = self.gpr(rt) as i64;
+                        if t == 0 {
+                            self.lo = 0;
+                            self.hi = 0;
+                        } else {
+                            self.lo = (s / t) as u64;
+                            self.hi = (s % t) as u64;
+                        }
+                        Ok(cycles::DIV_LATENCY)
+                    }
+                    0x1F => {
+                        let s = self.gpr(rs);
+                        let t = self.gpr(rt);
+                        if t == 0 {
+                            self.lo = 0;
+                            self.hi = 0;
+                        } else {
+                            self.lo = s / t;
+                            self.hi = s % t;
+                        }
+                        Ok(cycles::DIV_LATENCY)
+                    }
+                    0x2D => {
+                        self.set_gpr(rd, self.gpr(rs).wrapping_add(self.gpr(rt)));
+                        Ok(cycles::ALU)
+                    }
+                    0x2F => {
+                        self.set_gpr(rd, self.gpr(rs).wrapping_sub(self.gpr(rt)));
+                        Ok(cycles::ALU)
+                    }
+                    0x38 => {
+                        self.set_gpr(rd, self.gpr(rt) << sa);
+                        Ok(cycles::ALU)
+                    }
+                    0x3A => {
+                        self.set_gpr(rd, self.gpr(rt) >> sa);
+                        Ok(cycles::ALU)
+                    }
+                    0x3B => {
+                        self.set_gpr(rd, ((self.gpr(rt) as i64) >> sa) as u64);
+                        Ok(cycles::ALU)
+                    }
+                    0x3C => {
+                        self.set_gpr(rd, self.gpr(rt) << (sa + 32));
+                        Ok(cycles::ALU)
+                    }
+                    0x3E => {
+                        self.set_gpr(rd, self.gpr(rt) >> (sa + 32));
+                        Ok(cycles::ALU)
+                    }
+                    0x3F => {
+                        self.set_gpr(rd, ((self.gpr(rt) as i64) >> (sa + 32)) as u64);
+                        Ok(cycles::ALU)
+                    }
                     _ => Err(CpuHalt::UnimplementedOpcode { pc, word }),
                 }
             }
-            0x08 | 0x09 => {
+            0x08 | 0x09 | 0x18 | 0x19 => {
                 let v = self.gpr(rs).wrapping_add(imm_s as u64);
                 self.set_gpr(rt, v);
                 Ok(cycles::ALU)
@@ -494,10 +719,33 @@ impl R4300i {
                 self.set_gpr(rt, u64::from(imm_u) << 16);
                 Ok(cycles::ALU)
             }
+            0x33 => Ok(cycles::ALU),
             0x23 => {
                 let addr = self.gpr(rs).wrapping_add(imm_s as u64);
                 let v = self.load32(bus, addr)?;
                 self.set_gpr(rt, i64::from(v as i32) as u64);
+                Ok(cycles::MEM_ACCESS)
+            }
+            0x22 => {
+                let eff = self.gpr(rs).wrapping_add(imm_s as u64);
+                let al = eff & !3;
+                let mem_word = self.load32(bus, al)?;
+                let merged = self.merge_lwl(self.gpr(rt), mem_word, eff);
+                self.set_gpr(rt, i64::from(merged as i32) as u64);
+                Ok(cycles::MEM_ACCESS)
+            }
+            0x26 => {
+                let eff = self.gpr(rs).wrapping_add(imm_s as u64);
+                let al = eff & !3;
+                let mem_word = self.load32(bus, al)?;
+                let merged = self.merge_lwr(self.gpr(rt), mem_word, eff);
+                self.set_gpr(rt, i64::from(merged as i32) as u64);
+                Ok(cycles::MEM_ACCESS)
+            }
+            0x27 => {
+                let addr = self.gpr(rs).wrapping_add(imm_s as u64);
+                let v = self.load32(bus, addr)?;
+                self.set_gpr(rt, u64::from(v));
                 Ok(cycles::MEM_ACCESS)
             }
             0x24 => {
@@ -539,14 +787,120 @@ impl R4300i {
                 self.store16(bus, addr, self.gpr(rt) as u32)?;
                 Ok(cycles::MEM_ACCESS)
             }
+            0x2A => {
+                let eff = self.gpr(rs).wrapping_add(imm_s as u64);
+                self.store_swl(bus, eff, self.gpr(rt))?;
+                Ok(cycles::MEM_ACCESS)
+            }
+            0x2E => {
+                let eff = self.gpr(rs).wrapping_add(imm_s as u64);
+                self.store_swr(bus, eff, self.gpr(rt))?;
+                Ok(cycles::MEM_ACCESS)
+            }
+            0x30 => {
+                let addr = self.gpr(rs).wrapping_add(imm_s as u64);
+                if addr & 3 != 0 {
+                    return Err(CpuHalt::UnalignedAccess { vaddr: addr, width: 4 });
+                }
+                let v = self.load32(bus, addr)?;
+                self.ll_bit = true;
+                self.ll_addr = addr;
+                self.set_gpr(rt, i64::from(v as i32) as u64);
+                Ok(cycles::MEM_ACCESS)
+            }
+            0x38 => {
+                let addr = self.gpr(rs).wrapping_add(imm_s as u64);
+                if addr & 3 != 0 {
+                    return Err(CpuHalt::UnalignedAccess { vaddr: addr, width: 4 });
+                }
+                let ok = self.ll_bit && self.ll_addr == addr;
+                let val = self.gpr(rt) as u32;
+                if ok {
+                    self.store32(bus, addr, val)?;
+                }
+                self.ll_bit = false;
+                self.set_gpr(rt, if ok { 1 } else { 0 });
+                Ok(cycles::MEM_ACCESS)
+            }
+            0x34 => {
+                let addr = self.gpr(rs).wrapping_add(imm_s as u64);
+                if addr & 7 != 0 {
+                    return Err(CpuHalt::UnalignedAccess { vaddr: addr, width: 8 });
+                }
+                let v = self.load64(bus, addr)?;
+                self.ll_bit = true;
+                self.ll_addr = addr;
+                self.set_gpr(rt, v);
+                Ok(cycles::MEM_ACCESS)
+            }
+            0x3C => {
+                let addr = self.gpr(rs).wrapping_add(imm_s as u64);
+                if addr & 7 != 0 {
+                    return Err(CpuHalt::UnalignedAccess { vaddr: addr, width: 8 });
+                }
+                let ok = self.ll_bit && self.ll_addr == addr;
+                let val = self.gpr(rt);
+                if ok {
+                    self.store64(bus, addr, val)?;
+                }
+                self.ll_bit = false;
+                self.set_gpr(rt, if ok { 1 } else { 0 });
+                Ok(cycles::MEM_ACCESS)
+            }
+            // CACHE — I-type; no L1/I$/D$ model yet (commercial ROMs use this constantly).
+            0x2F => Ok(cycles::ALU),
+            // MIPS III / 64-bit loads & stores (GPR)
+            0x37 => {
+                let addr = self.gpr(rs).wrapping_add(imm_s as u64);
+                let v = self.load64(bus, addr)?;
+                self.set_gpr(rt, v);
+                Ok(cycles::MEM_ACCESS)
+            }
+            0x3F => {
+                let addr = self.gpr(rs).wrapping_add(imm_s as u64);
+                self.store64(bus, addr, self.gpr(rt))?;
+                Ok(cycles::MEM_ACCESS)
+            }
+            // CP1 load / store (I-type: `rt` index is `ft`)
+            0x31 => {
+                let addr = self.gpr(rs).wrapping_add(imm_s as u64);
+                let v = self.load32(bus, addr)?;
+                self.cop1.set_fpr_u32(rt, v);
+                Ok(cycles::MEM_ACCESS)
+            }
+            0x39 => {
+                let addr = self.gpr(rs).wrapping_add(imm_s as u64);
+                self.store32(bus, addr, self.cop1.fpr_u32(rt))?;
+                Ok(cycles::MEM_ACCESS)
+            }
+            0x35 => {
+                let addr = self.gpr(rs).wrapping_add(imm_s as u64);
+                let v = self.load64(bus, addr)?;
+                self.cop1.fpr[rt] = v;
+                Ok(cycles::MEM_ACCESS)
+            }
+            0x3D => {
+                let addr = self.gpr(rs).wrapping_add(imm_s as u64);
+                self.store64(bus, addr, self.cop1.fpr[rt])?;
+                Ok(cycles::MEM_ACCESS)
+            }
             0x10 => {
                 let sub = (word >> 21) & 0x1F;
                 let funct = word & 0x3F;
-                // `ERET` — COP0, cofun 0x18 (e.g. `0x4200_0018`).
-                if sub == 0x10 && funct == 0x18 {
-                    self.pc = self.cop0.apply_eret();
-                    self.ll_bit = false;
-                    return Ok(cycles::ALU);
+                // `CO` class: TLB ops + `ERET` (no full TLB yet).
+                if sub == 0x10 {
+                    match funct {
+                        0x01 | 0x02 | 0x05 | 0x06 | 0x08 => {
+                            // TLBR, TLBWI, ?, TLBWR, TLBP
+                            return Ok(cycles::ALU);
+                        }
+                        0x18 => {
+                            self.pc = self.cop0.apply_eret();
+                            self.ll_bit = false;
+                            return Ok(cycles::ALU);
+                        }
+                        _ => return Err(CpuHalt::UnimplementedOpcode { pc, word }),
+                    }
                 }
                 let rd_cop = ((word >> 11) & 0x1F) as u32;
                 match sub {
@@ -563,8 +917,350 @@ impl R4300i {
                     _ => Err(CpuHalt::UnimplementedOpcode { pc, word }),
                 }
             }
+            0x11 => self.exec_cop1(pc, word, bus),
             _ => Err(CpuHalt::UnimplementedOpcode { pc, word }),
         }
+    }
+
+    /// COP1: moves (`MFC1`, `CFC1`, …), `BC1F`/`BC1T`, and FP compute when bit 25 = 1 (common `.S`/`.D`).
+    fn exec_cop1(
+        &mut self,
+        pc: u64,
+        word: u32,
+        bus: &mut impl Bus,
+    ) -> Result<u64, CpuHalt> {
+        let fmt = (word >> 21) & 0x1F;
+        let rt = ((word >> 16) & 0x1F) as usize;
+        let fs = ((word >> 11) & 0x1F) as usize;
+        let _fd = ((word >> 6) & 0x1F) as usize;
+
+        if fmt == 0x08 {
+            return self.exec_bc1(pc, word, bus);
+        }
+
+        if (word >> 25) & 1 != 0 {
+            return self.exec_cop1_fp(pc, word);
+        }
+
+        match fmt {
+            0x00 => {
+                // MFC1
+                let v = self.cop1.fpr[fs] as u32;
+                self.set_gpr(rt, i64::from(v as i32) as u64);
+                Ok(cycles::COP_MOVE)
+            }
+            0x01 => {
+                // DMFC1
+                self.set_gpr(rt, self.cop1.fpr[fs]);
+                Ok(cycles::COP_MOVE)
+            }
+            0x04 => {
+                // MTC1
+                self.cop1.fpr[fs] = u64::from(self.gpr(rt) as u32);
+                Ok(cycles::COP_MOVE)
+            }
+            0x05 => {
+                // DMTC1
+                self.cop1.fpr[fs] = self.gpr(rt);
+                Ok(cycles::COP_MOVE)
+            }
+            0x02 => {
+                // CFC1
+                let v = self.cop1.read_fcr(fs);
+                self.set_gpr(rt, i64::from(v as i32) as u64);
+                Ok(cycles::COP_MOVE)
+            }
+            0x06 => {
+                // CTC1
+                self.cop1.write_fcr(fs, self.gpr(rt) as u32);
+                Ok(cycles::COP_MOVE)
+            }
+            _ => Err(CpuHalt::UnimplementedOpcode { pc, word }),
+        }
+    }
+
+    /// COP1 floating-point compute (`CO` / bit 25 = 1). Covers common `.S` / `.D` ops and compares.
+    fn exec_cop1_fp(&mut self, pc: u64, word: u32) -> Result<u64, CpuHalt> {
+        let fmt5 = (word >> 21) & 0x1F;
+        let ft = ((word >> 16) & 0x1F) as usize;
+        let fs = ((word >> 11) & 0x1F) as usize;
+        let fd = ((word >> 6) & 0x1F) as usize;
+        let funct = word & 0x3F;
+
+        // MIPS III: `fmt` in bits 24–21 with `CO`=1 → 0x10=.S, 0x11=.D, 0x14=.W, 0x15=.L
+        match fmt5 {
+            0x10 => {
+                // .S
+                match funct {
+                    0x00 => {
+                        let r = self.cop1.fpr_f32(fs) + self.cop1.fpr_f32(ft);
+                        self.cop1.set_fpr_f32(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x01 => {
+                        let r = self.cop1.fpr_f32(fs) - self.cop1.fpr_f32(ft);
+                        self.cop1.set_fpr_f32(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x02 => {
+                        let r = self.cop1.fpr_f32(fs) * self.cop1.fpr_f32(ft);
+                        self.cop1.set_fpr_f32(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x03 => {
+                        let a = self.cop1.fpr_f32(fs);
+                        let b = self.cop1.fpr_f32(ft);
+                        let r = if b == 0.0 { 0.0 } else { a / b };
+                        self.cop1.set_fpr_f32(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x04 => {
+                        let r = self.cop1.fpr_f32(fs).sqrt();
+                        self.cop1.set_fpr_f32(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x05 => {
+                        let r = self.cop1.fpr_f32(fs).abs();
+                        self.cop1.set_fpr_f32(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x06 => {
+                        let v = self.cop1.fpr_f32(fs);
+                        self.cop1.set_fpr_f32(fd, v);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x07 => {
+                        let r = -self.cop1.fpr_f32(fs);
+                        self.cop1.set_fpr_f32(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x0C => {
+                        // ROUND.W.S — to word using FCSR RM
+                        let rm = fcsr_rm(self.cop1.fcsr);
+                        let i = f32_to_i32_rm(self.cop1.fpr_f32(fs), rm);
+                        self.cop1.set_fpr_u32(fd, i as u32);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x0D => {
+                        // TRUNC.W.S — toward zero
+                        let i = f32_to_i32_trunc(self.cop1.fpr_f32(fs));
+                        self.cop1.set_fpr_u32(fd, i as u32);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x0E => {
+                        // CEIL.W.S
+                        let i = f32_to_i32_ceil(self.cop1.fpr_f32(fs));
+                        self.cop1.set_fpr_u32(fd, i as u32);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x0F => {
+                        // FLOOR.W.S
+                        let i = f32_to_i32_floor(self.cop1.fpr_f32(fs));
+                        self.cop1.set_fpr_u32(fd, i as u32);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x21 => {
+                        // CVT.D.S — single in `fs` → double in `fd`
+                        let r = f64::from(self.cop1.fpr_f32(fs));
+                        self.cop1.set_fpr_f64(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x24 => {
+                        // CVT.W.S — float → signed 32-bit word in FPR (uses FCSR RM)
+                        let rm = fcsr_rm(self.cop1.fcsr);
+                        let i = f32_to_i32_rm(self.cop1.fpr_f32(fs), rm);
+                        self.cop1.set_fpr_u32(fd, i as u32);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x25 => {
+                        // CVT.L.S — single → signed 64-bit integer in FPR (uses FCSR RM)
+                        let rm = fcsr_rm(self.cop1.fcsr);
+                        let i = f32_to_i64_rm(self.cop1.fpr_f32(fs), rm);
+                        self.cop1.fpr[fd] = i as u64;
+                        Ok(cycles::COP_MOVE)
+                    }
+                    f @ 0x30..=0x3F => {
+                        self.cop1.set_cc0(cond_f32(
+                            self.cop1.fpr_f32(fs),
+                            self.cop1.fpr_f32(ft),
+                            f,
+                        ));
+                        Ok(cycles::ALU)
+                    }
+                    _ => Err(CpuHalt::UnimplementedOpcode { pc, word }),
+                }
+            }
+            0x11 => {
+                // .D
+                match funct {
+                    0x00 => {
+                        let r = self.cop1.fpr_f64(fs) + self.cop1.fpr_f64(ft);
+                        self.cop1.set_fpr_f64(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x01 => {
+                        let r = self.cop1.fpr_f64(fs) - self.cop1.fpr_f64(ft);
+                        self.cop1.set_fpr_f64(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x02 => {
+                        let r = self.cop1.fpr_f64(fs) * self.cop1.fpr_f64(ft);
+                        self.cop1.set_fpr_f64(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x03 => {
+                        let a = self.cop1.fpr_f64(fs);
+                        let b = self.cop1.fpr_f64(ft);
+                        let r = if b == 0.0 { 0.0 } else { a / b };
+                        self.cop1.set_fpr_f64(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x04 => {
+                        let r = self.cop1.fpr_f64(fs).sqrt();
+                        self.cop1.set_fpr_f64(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x05 => {
+                        let r = self.cop1.fpr_f64(fs).abs();
+                        self.cop1.set_fpr_f64(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x06 => {
+                        let v = self.cop1.fpr_f64(fs);
+                        self.cop1.set_fpr_f64(fd, v);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x07 => {
+                        let r = -self.cop1.fpr_f64(fs);
+                        self.cop1.set_fpr_f64(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x0C => {
+                        let rm = fcsr_rm(self.cop1.fcsr);
+                        let i = f64_to_i32_rm(self.cop1.fpr_f64(fs), rm);
+                        self.cop1.set_fpr_u32(fd, i as u32);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x0D => {
+                        let i = f64_to_i32_trunc(self.cop1.fpr_f64(fs));
+                        self.cop1.set_fpr_u32(fd, i as u32);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x0E => {
+                        let i = f64_to_i32_ceil(self.cop1.fpr_f64(fs));
+                        self.cop1.set_fpr_u32(fd, i as u32);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x0F => {
+                        let i = f64_to_i32_floor(self.cop1.fpr_f64(fs));
+                        self.cop1.set_fpr_u32(fd, i as u32);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x20 => {
+                        // CVT.S.D
+                        let r = self.cop1.fpr_f64(fs) as f32;
+                        self.cop1.set_fpr_f32(fd, r);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x24 => {
+                        let rm = fcsr_rm(self.cop1.fcsr);
+                        let w = f64_to_i32_rm(self.cop1.fpr_f64(fs), rm);
+                        self.cop1.set_fpr_u32(fd, w as u32);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x25 => {
+                        let rm = fcsr_rm(self.cop1.fcsr);
+                        let i = f64_to_i64_rm(self.cop1.fpr_f64(fs), rm);
+                        self.cop1.fpr[fd] = i as u64;
+                        Ok(cycles::COP_MOVE)
+                    }
+                    f @ 0x30..=0x3F => {
+                        self.cop1.set_cc0(cond_f64(
+                            self.cop1.fpr_f64(fs),
+                            self.cop1.fpr_f64(ft),
+                            f,
+                        ));
+                        Ok(cycles::ALU)
+                    }
+                    _ => Err(CpuHalt::UnimplementedOpcode { pc, word }),
+                }
+            }
+            0x14 => {
+                // .W (fixed-point / integer in FPR)
+                match funct {
+                    0x20 => {
+                        // CVT.S.W — signed word in `fs` → single in `fd`
+                        let i = self.cop1.fpr_u32(fs) as i32;
+                        self.cop1.set_fpr_f32(fd, i as f32);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x21 => {
+                        // CVT.D.W
+                        let i = self.cop1.fpr_u32(fs) as i32;
+                        self.cop1.set_fpr_f64(fd, i as f64);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x25 => {
+                        // CVT.L.W — 32-bit fixed word in FPR → signed 64-bit in FPR
+                        let i = self.cop1.fpr_u32(fs) as i32 as i64;
+                        self.cop1.fpr[fd] = i as u64;
+                        Ok(cycles::COP_MOVE)
+                    }
+                    _ => Err(CpuHalt::UnimplementedOpcode { pc, word }),
+                }
+            }
+            0x15 => {
+                // `.L` — 64-bit integer in FPR (MIPS fmt L)
+                match funct {
+                    0x20 => {
+                        // CVT.S.L
+                        let v = self.cop1.fpr[fs] as i64;
+                        self.cop1.set_fpr_f32(fd, v as f32);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    0x21 => {
+                        // CVT.D.L
+                        let v = self.cop1.fpr[fs] as i64;
+                        self.cop1.set_fpr_f64(fd, v as f64);
+                        Ok(cycles::COP_MOVE)
+                    }
+                    _ => Err(CpuHalt::UnimplementedOpcode { pc, word }),
+                }
+            }
+            _ => Err(CpuHalt::UnimplementedOpcode { pc, word }),
+        }
+    }
+
+    /// `BC1F` / `BC1T`: branch on floating-point condition (uses FCSR CC bits).
+    fn exec_bc1(
+        &mut self,
+        pc: u64,
+        word: u32,
+        bus: &mut impl Bus,
+    ) -> Result<u64, CpuHalt> {
+        let imm = (((word & 0xFFFF) as i16) as i64) << 2;
+        let tf = (word >> 16) & 1 != 0;
+        let nd = (word >> 17) & 1 != 0;
+        let cc = (word >> 18) & 0x7;
+        let cond = (self.cop1.fcsr >> (23 + cc)) & 1;
+        let take = if tf { cond != 0 } else { cond == 0 };
+
+        if nd && !take {
+            self.pc = pc.wrapping_add(8);
+            return Ok(cycles::BRANCH);
+        }
+
+        let delay_pc = pc.wrapping_add(4);
+        let delay_word = self.fetch32(bus, delay_pc)?;
+        let mut cycles = cycles::BRANCH;
+        cycles += self.exec_non_branch(delay_pc, delay_word, bus)?;
+
+        self.pc = if take {
+            pc.wrapping_add(imm as u64).wrapping_add(4)
+        } else {
+            pc.wrapping_add(8)
+        };
+        Ok(cycles)
     }
 }
 
@@ -654,5 +1350,20 @@ mod tests {
         assert_eq!(cpu.step(&mut mem, false).unwrap(), crate::cycles::ALU);
         assert_eq!(cpu.pc, 0xFFFF_FFFF_8000_4000);
         assert!((cpu.cop0.status & STATUS_EXL) == 0);
+    }
+
+    #[test]
+    fn syscall_and_break_special_no_halt() {
+        let mut cpu = R4300i::new();
+        cpu.reset(0x8000_0000);
+        let mut mem = PhysicalMemory::new(1024 * 1024);
+        // SPECIAL + SYSCALL (funct 0x0C)
+        write_be32(&mut mem, 0, 0x0000_000C);
+        assert_eq!(cpu.step(&mut mem, false).unwrap(), cycles::ALU);
+        assert_eq!(cpu.pc, 0x8000_0004);
+        // SPECIAL + BREAK (funct 0x0D)
+        write_be32(&mut mem, 4, 0x0000_000D);
+        assert_eq!(cpu.step(&mut mem, false).unwrap(), cycles::ALU);
+        assert_eq!(cpu.pc, 0x8000_0008);
     }
 }

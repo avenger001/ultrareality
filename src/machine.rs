@@ -1,7 +1,7 @@
 //! Top-level machine: master cycle counter and devices that will eventually
 //! run on the same 93.75 MHz (NTSC) timeline as the RCP.
 
-use crate::boot::{cart_boot_pc, DEFAULT_GAME_SP};
+use crate::boot::{hle_ipl3_load_rom, DEFAULT_GAME_SP};
 use crate::bus::SystemBus;
 use crate::cpu::{CpuHalt, R4300i};
 
@@ -25,10 +25,10 @@ impl Machine {
         self.bus.pi = crate::pi::Pi::with_rom(rom);
     }
 
-    /// HLE bootstrap: set PC from cart ROM header (`0x0C`) and a typical SP.
-    /// Does **not** run PIF/CIC; use for bring-up until PIF is emulated.
+    /// HLE bootstrap: IPL3-style ROM→RDRAM copy, then PC from header boot address (`0x08`).
+    /// Does **not** run PIF/CIC (no CIC 6103/6106 PC adjust); use for bring-up until PIF is emulated.
     pub fn bootstrap_hle_cart_entry(&mut self) {
-        let Some(pc) = cart_boot_pc(&self.bus.pi.rom) else {
+        let Some(pc) = hle_ipl3_load_rom(&self.bus.pi.rom, &mut self.bus.rdram) else {
             return;
         };
         self.cpu.reset(pc);

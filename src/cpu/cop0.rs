@@ -88,7 +88,10 @@ impl Cop0 {
             12 => self.status,
             13 => self.cause,
             14 => self.epc as u32,
-            15 => (self.epc >> 32) as u32,
+            15 => {
+                // PRId — VR4300 (games read COP0 r15; not EPC high).
+                0x0B00_0002
+            }
             30 => self.error_epc as u32,
             31 => (self.error_epc >> 32) as u32,
             _ => 0,
