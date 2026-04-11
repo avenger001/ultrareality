@@ -1,5 +1,5 @@
 use super::cop0::Cop0;
-use crate::bus::{virt_to_phys_rdram, Bus};
+use crate::bus::{virt_to_phys, Bus};
 use crate::cycles;
 
 #[derive(Clone, Debug)]
@@ -65,69 +65,69 @@ impl R4300i {
         }
     }
 
-    fn fetch32(&self, bus: &mut impl Bus, rdram_size: usize, vaddr: u64) -> Result<u32, CpuHalt> {
+    fn fetch32(&self, bus: &mut impl Bus, vaddr: u64) -> Result<u32, CpuHalt> {
         if vaddr & 3 != 0 {
             return Err(CpuHalt::UnalignedFetch { vaddr });
         }
-        let p = virt_to_phys_rdram(vaddr, rdram_size).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
+        let p = virt_to_phys(vaddr).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         bus.read_u32(p).ok_or(CpuHalt::UnmappedAddress { vaddr })
     }
 
-    fn load32(&mut self, bus: &mut impl Bus, rdram_size: usize, vaddr: u64) -> Result<u32, CpuHalt> {
+    fn load32(&mut self, bus: &mut impl Bus, vaddr: u64) -> Result<u32, CpuHalt> {
         if vaddr & 3 != 0 {
             return Err(CpuHalt::UnalignedAccess { vaddr, width: 4 });
         }
-        let p = virt_to_phys_rdram(vaddr, rdram_size).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
+        let p = virt_to_phys(vaddr).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         bus.read_u32(p).ok_or(CpuHalt::UnmappedAddress { vaddr })
     }
 
-    fn store32(&mut self, bus: &mut impl Bus, rdram_size: usize, vaddr: u64, value: u32) -> Result<(), CpuHalt> {
+    fn store32(&mut self, bus: &mut impl Bus, vaddr: u64, value: u32) -> Result<(), CpuHalt> {
         if vaddr & 3 != 0 {
             return Err(CpuHalt::UnalignedAccess { vaddr, width: 4 });
         }
-        let p = virt_to_phys_rdram(vaddr, rdram_size).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
+        let p = virt_to_phys(vaddr).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         bus.write_u32(p, value);
         Ok(())
     }
 
-    fn load16_signed(&mut self, bus: &mut impl Bus, rdram_size: usize, vaddr: u64) -> Result<u32, CpuHalt> {
+    fn load16_signed(&mut self, bus: &mut impl Bus, vaddr: u64) -> Result<u32, CpuHalt> {
         if vaddr & 1 != 0 {
             return Err(CpuHalt::UnalignedAccess { vaddr, width: 2 });
         }
-        let p = virt_to_phys_rdram(vaddr, rdram_size).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
+        let p = virt_to_phys(vaddr).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         let hi = bus.read_u8(p).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         let lo = bus.read_u8(p.wrapping_add(1)).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         let h = u16::from_be_bytes([hi, lo]);
         Ok(i32::from(h as i16) as u32)
     }
 
-    fn load16_unsigned(&mut self, bus: &mut impl Bus, rdram_size: usize, vaddr: u64) -> Result<u32, CpuHalt> {
+    fn load16_unsigned(&mut self, bus: &mut impl Bus, vaddr: u64) -> Result<u32, CpuHalt> {
         if vaddr & 1 != 0 {
             return Err(CpuHalt::UnalignedAccess { vaddr, width: 2 });
         }
-        let p = virt_to_phys_rdram(vaddr, rdram_size).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
+        let p = virt_to_phys(vaddr).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         let hi = bus.read_u8(p).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         let lo = bus.read_u8(p.wrapping_add(1)).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         Ok(u32::from(u16::from_be_bytes([hi, lo])))
     }
 
-    fn load8_signed(&mut self, bus: &mut impl Bus, rdram_size: usize, vaddr: u64) -> Result<u32, CpuHalt> {
-        let p = virt_to_phys_rdram(vaddr, rdram_size).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
+    fn load8_signed(&mut self, bus: &mut impl Bus, vaddr: u64) -> Result<u32, CpuHalt> {
+        let p = virt_to_phys(vaddr).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         let b = bus.read_u8(p).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         Ok(i32::from(b as i8) as u32)
     }
 
-    fn load8_unsigned(&mut self, bus: &mut impl Bus, rdram_size: usize, vaddr: u64) -> Result<u32, CpuHalt> {
-        let p = virt_to_phys_rdram(vaddr, rdram_size).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
+    fn load8_unsigned(&mut self, bus: &mut impl Bus, vaddr: u64) -> Result<u32, CpuHalt> {
+        let p = virt_to_phys(vaddr).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         let b = bus.read_u8(p).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         Ok(u32::from(b))
     }
 
-    fn store16(&mut self, bus: &mut impl Bus, rdram_size: usize, vaddr: u64, value: u32) -> Result<(), CpuHalt> {
+    fn store16(&mut self, bus: &mut impl Bus, vaddr: u64, value: u32) -> Result<(), CpuHalt> {
         if vaddr & 1 != 0 {
             return Err(CpuHalt::UnalignedAccess { vaddr, width: 2 });
         }
-        let p = virt_to_phys_rdram(vaddr, rdram_size).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
+        let p = virt_to_phys(vaddr).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         let half = (value & 0xFFFF) as u16;
         let [a, b] = half.to_be_bytes();
         bus.write_u8(p, a);
@@ -135,24 +135,35 @@ impl R4300i {
         Ok(())
     }
 
-    fn store8(&mut self, bus: &mut impl Bus, rdram_size: usize, vaddr: u64, value: u32) -> Result<(), CpuHalt> {
-        let p = virt_to_phys_rdram(vaddr, rdram_size).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
+    fn store8(&mut self, bus: &mut impl Bus, vaddr: u64, value: u32) -> Result<(), CpuHalt> {
+        let p = virt_to_phys(vaddr).ok_or(CpuHalt::UnmappedAddress { vaddr })?;
         bus.write_u8(p, (value & 0xFF) as u8);
         Ok(())
     }
 
     /// Execute one **architectural** instruction (including its delay slot for
     /// branches/jumps). Returns CPU cycles consumed for this retirement.
-    pub fn step(&mut self, bus: &mut impl Bus, rdram_size: usize) -> Result<u64, CpuHalt> {
+    ///
+    /// `rcp_interrupt`: MI-driven external interrupt line (pending ∧ mask). If
+    /// [`crate::cpu::cop0::Cop0::interrupts_enabled`], takes exception before fetch.
+    pub fn step(&mut self, bus: &mut impl Bus, rcp_interrupt: bool) -> Result<u64, CpuHalt> {
+        if rcp_interrupt && self.cop0.interrupts_enabled() {
+            let epc = self.pc;
+            let v = self.cop0.interrupt_vector();
+            self.cop0.enter_interrupt_exception(epc);
+            self.pc = v;
+            return Ok(cycles::INTERRUPT);
+        }
+
         let pc = self.pc;
-        let word = self.fetch32(bus, rdram_size, pc)?;
+        let word = self.fetch32(bus, pc)?;
         let op = word >> 26;
 
         match op {
-            0 => self.exec_special(pc, word, bus, rdram_size),
-            1 => self.exec_regimm(pc, word, bus, rdram_size),
-            2 | 3 => self.exec_j_type(pc, word, bus, rdram_size),
-            _ => self.exec_common_i_type(pc, word, bus, rdram_size, op),
+            0 => self.exec_special(pc, word, bus),
+            1 => self.exec_regimm(pc, word, bus),
+            2 | 3 => self.exec_j_type(pc, word, bus),
+            _ => self.exec_common_i_type(pc, word, bus, op),
         }
     }
 
@@ -161,7 +172,6 @@ impl R4300i {
         pc: u64,
         word: u32,
         bus: &mut impl Bus,
-        rdram_size: usize,
     ) -> Result<u64, CpuHalt> {
         let op = word >> 26;
         let target = (pc & 0xF000_0000) | u64::from(word & 0x03FF_FFFF) << 2;
@@ -173,8 +183,8 @@ impl R4300i {
         }
 
         let delay_pc = pc.wrapping_add(4);
-        let delay_word = self.fetch32(bus, rdram_size, delay_pc)?;
-        cycles += self.exec_non_branch(delay_pc, delay_word, bus, rdram_size)?;
+        let delay_word = self.fetch32(bus, delay_pc)?;
+        cycles += self.exec_non_branch(delay_pc, delay_word, bus)?;
         self.pc = target;
         Ok(cycles)
     }
@@ -184,7 +194,6 @@ impl R4300i {
         pc: u64,
         word: u32,
         bus: &mut impl Bus,
-        rdram_size: usize,
     ) -> Result<u64, CpuHalt> {
         let rt = ((word >> 16) & 0x1F) as usize;
         let rs = ((word >> 21) & 0x1F) as usize;
@@ -202,8 +211,8 @@ impl R4300i {
         };
 
         let delay_pc = pc.wrapping_add(4);
-        let delay_word = self.fetch32(bus, rdram_size, delay_pc)?;
-        cycles += self.exec_non_branch(delay_pc, delay_word, bus, rdram_size)?;
+        let delay_word = self.fetch32(bus, delay_pc)?;
+        cycles += self.exec_non_branch(delay_pc, delay_word, bus)?;
 
         self.pc = if take {
             pc.wrapping_add((imm << 2) as u64).wrapping_add(4)
@@ -218,7 +227,6 @@ impl R4300i {
         pc: u64,
         word: u32,
         bus: &mut impl Bus,
-        rdram_size: usize,
     ) -> Result<u64, CpuHalt> {
         let funct = word & 0x3F;
         let _sa = ((word >> 6) & 0x1F) as u32;
@@ -232,8 +240,8 @@ impl R4300i {
                 let target = self.gpr(rs);
                 let mut cycles = cycles::BRANCH;
                 let delay_pc = pc.wrapping_add(4);
-                let delay_word = self.fetch32(bus, rdram_size, delay_pc)?;
-                cycles += self.exec_non_branch(delay_pc, delay_word, bus, rdram_size)?;
+                let delay_word = self.fetch32(bus, delay_pc)?;
+                cycles += self.exec_non_branch(delay_pc, delay_word, bus)?;
                 self.pc = target;
                 Ok(cycles)
             }
@@ -243,13 +251,13 @@ impl R4300i {
                 self.set_gpr(rd, pc.wrapping_add(8));
                 let mut cycles = cycles::BRANCH;
                 let delay_pc = pc.wrapping_add(4);
-                let delay_word = self.fetch32(bus, rdram_size, delay_pc)?;
-                cycles += self.exec_non_branch(delay_pc, delay_word, bus, rdram_size)?;
+                let delay_word = self.fetch32(bus, delay_pc)?;
+                cycles += self.exec_non_branch(delay_pc, delay_word, bus)?;
                 self.pc = target;
                 Ok(cycles)
             }
             _ => {
-                let c = self.exec_non_branch(pc, word, bus, rdram_size)?;
+                let c = self.exec_non_branch(pc, word, bus)?;
                 self.pc = pc.wrapping_add(4);
                 Ok(c)
             }
@@ -261,13 +269,12 @@ impl R4300i {
         pc: u64,
         word: u32,
         bus: &mut impl Bus,
-        rdram_size: usize,
         op: u32,
     ) -> Result<u64, CpuHalt> {
         match op {
-            0x04 | 0x05 | 0x06 | 0x07 => self.exec_branch(pc, word, bus, rdram_size, op),
+            0x04 | 0x05 | 0x06 | 0x07 => self.exec_branch(pc, word, bus, op),
             _ => {
-                let c = self.exec_non_branch(pc, word, bus, rdram_size)?;
+                let c = self.exec_non_branch(pc, word, bus)?;
                 self.pc = pc.wrapping_add(4);
                 Ok(c)
             }
@@ -279,7 +286,6 @@ impl R4300i {
         pc: u64,
         word: u32,
         bus: &mut impl Bus,
-        rdram_size: usize,
         op: u32,
     ) -> Result<u64, CpuHalt> {
         let rs = ((word >> 21) & 0x1F) as usize;
@@ -296,8 +302,8 @@ impl R4300i {
         };
 
         let delay_pc = pc.wrapping_add(4);
-        let delay_word = self.fetch32(bus, rdram_size, delay_pc)?;
-        cycles += self.exec_non_branch(delay_pc, delay_word, bus, rdram_size)?;
+        let delay_word = self.fetch32(bus, delay_pc)?;
+        cycles += self.exec_non_branch(delay_pc, delay_word, bus)?;
 
         self.pc = if take {
             pc.wrapping_add(imm as u64).wrapping_add(4)
@@ -312,7 +318,6 @@ impl R4300i {
         pc: u64,
         word: u32,
         bus: &mut impl Bus,
-        rdram_size: usize,
     ) -> Result<u64, CpuHalt> {
         let op = word >> 26;
         let rs = ((word >> 21) & 0x1F) as usize;
@@ -482,47 +487,47 @@ impl R4300i {
             }
             0x23 => {
                 let addr = self.gpr(rs).wrapping_add(imm_s as u64);
-                let v = self.load32(bus, rdram_size, addr)?;
+                let v = self.load32(bus, addr)?;
                 self.set_gpr(rt, i64::from(v as i32) as u64);
                 Ok(cycles::MEM_ACCESS)
             }
             0x24 => {
                 let addr = self.gpr(rs).wrapping_add(imm_s as u64);
-                let v = self.load8_unsigned(bus, rdram_size, addr)?;
+                let v = self.load8_unsigned(bus, addr)?;
                 self.set_gpr(rt, u64::from(v));
                 Ok(cycles::MEM_ACCESS)
             }
             0x20 => {
                 let addr = self.gpr(rs).wrapping_add(imm_s as u64);
-                let v = self.load8_signed(bus, rdram_size, addr)?;
+                let v = self.load8_signed(bus, addr)?;
                 self.set_gpr(rt, i64::from(v as i32) as u64);
                 Ok(cycles::MEM_ACCESS)
             }
             0x25 => {
                 let addr = self.gpr(rs).wrapping_add(imm_s as u64);
-                let v = self.load16_unsigned(bus, rdram_size, addr)?;
+                let v = self.load16_unsigned(bus, addr)?;
                 self.set_gpr(rt, u64::from(v));
                 Ok(cycles::MEM_ACCESS)
             }
             0x21 => {
                 let addr = self.gpr(rs).wrapping_add(imm_s as u64);
-                let v = self.load16_signed(bus, rdram_size, addr)?;
+                let v = self.load16_signed(bus, addr)?;
                 self.set_gpr(rt, i64::from(v as i32) as u64);
                 Ok(cycles::MEM_ACCESS)
             }
             0x2B => {
                 let addr = self.gpr(rs).wrapping_add(imm_s as u64);
-                self.store32(bus, rdram_size, addr, self.gpr(rt) as u32)?;
+                self.store32(bus, addr, self.gpr(rt) as u32)?;
                 Ok(cycles::MEM_ACCESS)
             }
             0x28 => {
                 let addr = self.gpr(rs).wrapping_add(imm_s as u64);
-                self.store8(bus, rdram_size, addr, self.gpr(rt) as u32)?;
+                self.store8(bus, addr, self.gpr(rt) as u32)?;
                 Ok(cycles::MEM_ACCESS)
             }
             0x29 => {
                 let addr = self.gpr(rs).wrapping_add(imm_s as u64);
-                self.store16(bus, rdram_size, addr, self.gpr(rt) as u32)?;
+                self.store16(bus, addr, self.gpr(rt) as u32)?;
                 Ok(cycles::MEM_ACCESS)
             }
             0x10 => {
@@ -567,17 +572,16 @@ mod tests {
         let mut cpu = R4300i::new();
         cpu.reset(0x8000_0000);
         let mut mem = PhysicalMemory::new(1024 * 1024);
-        let sz = mem.data.len();
         // lui t0, 0x1234
         write_be32(&mut mem, 0, 0x3C081234);
         // addiu t1, t0, 0x5678  (encoding: rs=t0=8, rt=t1=9)
         write_be32(&mut mem, 4, 0x2509_5678);
 
-        assert_eq!(cpu.step(&mut mem, sz).unwrap(), cycles::ALU);
+        assert_eq!(cpu.step(&mut mem, false).unwrap(), cycles::ALU);
         assert_eq!(cpu.pc, 0x8000_0004);
         assert_eq!(cpu.regs[8], 0x1234_0000);
 
-        assert_eq!(cpu.step(&mut mem, sz).unwrap(), cycles::ALU);
+        assert_eq!(cpu.step(&mut mem, false).unwrap(), cycles::ALU);
         assert_eq!(cpu.pc, 0x8000_0008);
         assert_eq!(cpu.regs[9], 0x1234_5678);
     }
@@ -586,7 +590,6 @@ mod tests {
     fn branch_delay_slot_skipped_when_not_taken() {
         let mut cpu = R4300i::new();
         let mut mem = PhysicalMemory::new(1024 * 1024);
-        let sz = mem.data.len();
         // beq r0,r0,+2  -> skip 8 bytes if taken; we use r0!=r0 so not taken
         // actually beq r0,r0 is always taken. Use bne r0, r0
         // 0x80000000: bne $0,$0,+2  (not taken)  opcode 0x05
@@ -598,7 +601,7 @@ mod tests {
 
         cpu.pc = 0x8000_0000;
         cpu.regs[8] = 0;
-        let c = cpu.step(&mut mem, sz).unwrap();
+        let c = cpu.step(&mut mem, false).unwrap();
         assert!(c > cycles::ALU);
         assert_eq!(cpu.regs[8], 1, "delay slot must run");
         assert_eq!(cpu.pc, 0x8000_0008);
@@ -608,14 +611,13 @@ mod tests {
     fn jump_and_link_sets_ra() {
         let mut cpu = R4300i::new();
         let mut mem = PhysicalMemory::new(1024 * 1024);
-        let sz = mem.data.len();
         // j 0x80000020  (word index: target byte 0x80000020)
         // Encoding: upper 4 bits from PC | imm26<<2
         write_be32(&mut mem, 0, 0x0C00_0008);
         // delay: nop
         write_be32(&mut mem, 4, 0x0000_0000);
         cpu.pc = 0x8000_0000;
-        cpu.step(&mut mem, sz).unwrap();
+        cpu.step(&mut mem, false).unwrap();
         assert_eq!(cpu.pc, 0x8000_0020);
         assert_eq!(cpu.regs[31], 0x8000_0008);
     }

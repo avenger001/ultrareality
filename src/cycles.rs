@@ -24,3 +24,6 @@ pub const MEM_ACCESS: u64 = 1;
 
 /// Coprocessor register move (MFC/MTC).
 pub const COP_MOVE: u64 = 1;
+
+/// External interrupt exception taken (RCP / MI line).
+pub const INTERRUPT: u64 = 2;

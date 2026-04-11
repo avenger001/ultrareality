@@ -1,4 +1,20 @@
-//! COP0 subset: Status, Cause, EPC — enough for exception entry/return scaffolding.
+//! COP0 subset: Status, Cause, EPC — exceptions and interrupt scaffolding.
+
+/// Status: interrupt enable (IE).
+pub const STATUS_IE: u32 = 1 << 0;
+/// Status: exception level (EXL).
+pub const STATUS_EXL: u32 = 1 << 1;
+/// Status: error level (ERL).
+pub const STATUS_ERL: u32 = 1 << 2;
+/// Status: bootstrap exception vectors (BEV).
+pub const STATUS_BEV: u32 = 1 << 22;
+
+/// Cause: exception code field (bits 2–6).
+pub const CAUSE_EXCCODE_SHIFT: u32 = 2;
+pub const CAUSE_EXCCODE_MASK: u32 = 0x1F;
+
+/// Exception code: interrupt.
+pub const EXCCODE_INT: u32 = 0;
 
 #[derive(Clone, Debug)]
 pub struct Cop0 {
@@ -21,6 +37,32 @@ impl Cop0 {
             compare: 0,
             count: 0,
         }
+    }
+
+    /// True if interrupts are globally enabled and not blocked by EXL/ERL.
+    #[inline]
+    pub fn interrupts_enabled(&self) -> bool {
+        (self.status & STATUS_IE) != 0
+            && (self.status & STATUS_EXL) == 0
+            && (self.status & STATUS_ERL) == 0
+    }
+
+    /// Vector for external interrupt: `0x80000180` (cached) or `0xBFC00380` (BEV).
+    #[inline]
+    pub fn interrupt_vector(&self) -> u64 {
+        if (self.status & STATUS_BEV) != 0 {
+            0xFFFF_FFFF_BFC0_0380u64
+        } else {
+            0xFFFF_FFFF_8000_0180u64
+        }
+    }
+
+    /// Record an interrupt exception before redirecting `PC` (caller sets `pc`).
+    pub fn enter_interrupt_exception(&mut self, epc: u64) {
+        self.epc = epc;
+        self.cause = (self.cause & !(CAUSE_EXCCODE_MASK << CAUSE_EXCCODE_SHIFT))
+            | (EXCCODE_INT << CAUSE_EXCCODE_SHIFT);
+        self.status |= STATUS_EXL;
     }
 
     pub fn read_32(&self, reg: u32) -> u32 {
