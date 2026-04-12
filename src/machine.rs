@@ -1,6 +1,7 @@
 //! Top-level machine: [`crate::timing::RCP_MASTER_HZ_NTSC`] master cycle counter.
-//! PI / SI / AI / VI defer RCP cycle debt into [`crate::bus::SystemBus::drain_deferred_cycles`]
-//! each CPU step so `Count`, `master_cycles`, and VI frame timing stay aligned.
+//! Each step adds CPU cycles plus VI/RDP deferred debt ([`crate::bus::SystemBus::drain_deferred_cycles`]),
+//! then advances in-flight PI/SI/AI DMA on the same quantum ([`crate::bus::SystemBus::rcp_advance_dma_in_flight`])
+//! so `Count`, `master_cycles`, and VI frame timing stay aligned.
 
 use crate::boot::{ipl3_load_via_pi_dma, DEFAULT_GAME_SP};
 use crate::bus::SystemBus;
@@ -62,6 +63,7 @@ impl Machine {
         let c = self.cpu.step(&mut self.bus, irq)?;
         let def = self.bus.drain_deferred_cycles();
         let delta = c.saturating_add(def);
+        self.bus.rcp_advance_dma_in_flight(delta);
         self.master_cycles = self.master_cycles.wrapping_add(delta);
         self.last_retired_cycles = delta;
         self.bus.advance_vi_frame_timing(delta);
@@ -80,6 +82,7 @@ impl Machine {
             let c = self.cpu.step(&mut self.bus, irq)?;
             let def = self.bus.drain_deferred_cycles();
             let delta = c.saturating_add(def);
+            self.bus.rcp_advance_dma_in_flight(delta);
             self.master_cycles = self.master_cycles.wrapping_add(delta);
             self.last_retired_cycles = delta;
             self.bus.advance_vi_frame_timing(delta);
@@ -103,6 +106,8 @@ mod tests {
         KSEG0_INTERRUPT_VECTOR_PC, MIPS_OPCODE_BREAK, STATUS_EXL, STATUS_IE,
     };
     use crate::ai::{AI_REG_LEN, AI_REGS_BASE};
+    use crate::timing::{ai_pcm_buffer_cycles, pi_cart_dma_total_cycles};
+    use crate::si::SI_DMA_CYCLES;
 
     /// Test RDRAM destinations for PI/SI DMA integration tests (physical).
     const RDRAM_TEST_PI_DST: u32 = 0x100;
@@ -174,6 +179,9 @@ mod tests {
         );
         m.bus.write_u32(PI_REGS_BASE + PI_REG_RD_LEN, 3);
 
+        assert_eq!(m.bus.mi.intr & MI_INTR_PI, 0);
+        m.bus
+            .rcp_advance_dma_in_flight(pi_cart_dma_total_cycles(4));
         assert_ne!(m.bus.mi.intr & MI_INTR_PI, 0);
         assert_eq!(
             m.bus.rdram.read_u32(RDRAM_TEST_PI_DST).unwrap(),
@@ -207,6 +215,8 @@ mod tests {
         m.bus.write_u32(SI_REGS_BASE + SI_REG_DRAM_ADDR, RDRAM_TEST_SI_DST);
         m.bus.write_u32(SI_REGS_BASE + SI_REG_PIF_ADDR_RD64B, PIF_RAM_START);
 
+        assert_eq!(m.bus.mi.intr & MI_INTR_SI, 0);
+        m.bus.rcp_advance_dma_in_flight(SI_DMA_CYCLES);
         assert_ne!(m.bus.mi.intr & MI_INTR_SI, 0);
         assert_eq!(
             m.bus.rdram.read_u32(RDRAM_TEST_SI_DST).unwrap(),
@@ -233,6 +243,9 @@ mod tests {
 
         m.bus.write_u32(AI_REGS_BASE + AI_REG_LEN, 0x400);
 
+        assert_eq!(m.bus.mi.intr & MI_INTR_AI, 0);
+        m.bus
+            .rcp_advance_dma_in_flight(ai_pcm_buffer_cycles(0x400));
         assert_ne!(m.bus.mi.intr & MI_INTR_AI, 0);
         m.step().unwrap();
         assert_eq!(m.cpu.pc, KSEG0_INTERRUPT_VECTOR_PC);

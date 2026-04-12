@@ -1,4 +1,7 @@
 //! Parallel Interface (PI): cartridge ROM access and PI DMA into RDRAM.
+//!
+//! Cart → RDRAM DMA is **deferred**: the transfer runs to completion after enough RCP cycles
+//! elapse on the master timeline ([`Pi::advance_time`]), keeping `PI_STATUS` bit0 busy until then.
 
 use crate::bus::{Bus, PhysicalMemory};
 use crate::mi::{Mi, MI_INTR_PI};
@@ -25,6 +28,15 @@ pub const PI_REG_WR_LEN: u32 = 0x10;
 /// RCP cycles per byte for PI cart ROM DMA ([`PI_ROM_DMA_CYCLES_PER_BYTE`](crate::timing::PI_ROM_DMA_CYCLES_PER_BYTE)).
 pub const PI_CYCLES_PER_DMA_BYTE: u64 = PI_ROM_DMA_CYCLES_PER_BYTE;
 
+#[derive(Debug, Clone)]
+struct PiDmaActive {
+    remaining_rcp_cycles: u64,
+    cart_addr: u32,
+    dram_addr: u32,
+    len: u64,
+    cart_to_rdram: bool,
+}
+
 #[derive(Debug)]
 pub struct Pi {
     pub rom: Vec<u8>,
@@ -34,9 +46,9 @@ pub struct Pi {
     pub rd_len: u32,
     /// Last value written to `PI_WR_LEN` (length − 1); for debugging / extension.
     pub wr_len: u32,
-    /// Minimal status: bit0 = DMA busy (stub), bit1 = interrupt (stub).
+    /// Minimal status: bit0 = DMA busy, bit1 = interrupt (completion).
     pub status: u32,
-    pending_cycles: u64,
+    active: Option<PiDmaActive>,
 }
 
 impl Pi {
@@ -48,7 +60,7 @@ impl Pi {
             rd_len: 0,
             wr_len: 0,
             status: 0,
-            pending_cycles: 0,
+            active: None,
         }
     }
 
@@ -60,14 +72,14 @@ impl Pi {
             rd_len: 0,
             wr_len: 0,
             status: 0,
-            pending_cycles: 0,
+            active: None,
         }
     }
 
-    pub fn drain_cycles(&mut self) -> u64 {
-        let c = self.pending_cycles;
-        self.pending_cycles = 0;
-        c
+    /// True while a PI DMA is in flight (matches `PI_STATUS` bit0).
+    #[inline]
+    pub fn dma_busy(&self) -> bool {
+        self.active.is_some()
     }
 
     fn reg_offset(paddr: u32) -> Option<u32> {
@@ -91,7 +103,7 @@ impl Pi {
         }
     }
 
-    pub fn write_reg(&mut self, paddr: u32, value: u32, rdram: &mut PhysicalMemory, mi: &mut Mi) {
+    pub fn write_reg(&mut self, paddr: u32, value: u32, _rdram: &mut PhysicalMemory, mi: &mut Mi) {
         let Some(off) = Self::reg_offset(paddr) else {
             return;
         };
@@ -100,17 +112,18 @@ impl Pi {
             PI_REG_CART_ADDR => self.cart_addr = value,
             PI_REG_RD_LEN => {
                 self.rd_len = value & 0x00FF_FFFF;
-                self.dma_read(rdram, self.rd_len, mi);
+                self.dma_read_kick(self.rd_len, mi);
             }
             PI_REG_WR_LEN => {
                 self.wr_len = value & 0x00FF_FFFF;
-                self.dma_write(rdram, self.wr_len, mi);
+                self.dma_write_kick(self.wr_len, mi);
             }
             _ => {}
         }
     }
 
     /// Cartridge ROM → RDRAM via the same DMA engine as MMIO (`PI_DRAM_ADDR`, `PI_CART_ADDR`, `PI_RD_LEN`).
+    /// Fast-forwards the in-flight timer so IPL-style loaders see RDRAM filled without stepping the CPU.
     pub fn dma_cart_segment_to_rdram(
         &mut self,
         rdram: &mut PhysicalMemory,
@@ -124,44 +137,75 @@ impl Pi {
         }
         self.cart_addr = cart_bus_addr;
         self.dram_addr = rdram_phys;
-        self.dma_read(rdram, len - 1, mi);
+        self.dma_read_kick(len - 1, mi);
+        self.advance_time(u64::MAX, rdram, mi);
     }
 
-    /// PI “read” DMA: cartridge ROM → RDRAM. `len_minus_one` is the value written to PI_RD_LEN.
-    fn dma_read(&mut self, rdram: &mut PhysicalMemory, len_minus_one: u32, mi: &mut Mi) {
+    fn dma_read_kick(&mut self, len_minus_one: u32, mi: &mut Mi) {
         let len = (len_minus_one as u64).saturating_add(1);
         if len == 0 {
             return;
         }
-        // bit0 busy, bit1 interrupt (set at completion); clear old interrupt when starting.
+        mi.clear(MI_INTR_PI);
         self.status = (self.status & !2) | 1;
-
-        let rdram_mask = (rdram.data.len() as u64).saturating_sub(1);
-        let mut dram = (self.dram_addr as u64) & rdram_mask;
-
-        for i in 0..len {
-            let cart_p = self.cart_addr.wrapping_add(i as u32);
-            let b = self.read_cart_u8(cart_p);
-            let p = (dram as u32) & (rdram_mask as u32);
-            rdram.write_u8(p, b);
-            dram = dram.wrapping_add(1) & rdram_mask;
-        }
-
-        self.pending_cycles = self
-            .pending_cycles
-            .saturating_add(pi_cart_dma_total_cycles(len));
-        self.status = (self.status & !1) | 2;
-        mi.raise(MI_INTR_PI);
+        let cost = pi_cart_dma_total_cycles(len);
+        self.active = Some(PiDmaActive {
+            remaining_rcp_cycles: cost,
+            cart_addr: self.cart_addr,
+            dram_addr: self.dram_addr,
+            len,
+            cart_to_rdram: true,
+        });
     }
 
-    /// PI “write” DMA: RDRAM → cart (save chips). No writable retail ROM; consume cycles only.
-    fn dma_write(&mut self, rdram: &mut PhysicalMemory, len_minus_one: u32, mi: &mut Mi) {
+    fn dma_write_kick(&mut self, len_minus_one: u32, mi: &mut Mi) {
         let len = (len_minus_one as u64).saturating_add(1);
-        self.pending_cycles = self
-            .pending_cycles
-            .saturating_add(pi_cart_dma_total_cycles(len));
-        let _ = rdram;
-        self.status |= 2;
+        if len == 0 {
+            return;
+        }
+        mi.clear(MI_INTR_PI);
+        self.status = (self.status & !2) | 1;
+        let cost = pi_cart_dma_total_cycles(len);
+        self.active = Some(PiDmaActive {
+            remaining_rcp_cycles: cost,
+            cart_addr: self.cart_addr,
+            dram_addr: self.dram_addr,
+            len,
+            cart_to_rdram: false,
+        });
+    }
+
+    /// Apply `delta` RCP cycles to any in-flight PI DMA; completes copies and raises `MI_INTR_PI` when due.
+    pub fn advance_time(&mut self, delta: u64, rdram: &mut PhysicalMemory, mi: &mut Mi) {
+        let mut d = delta;
+        while d > 0 {
+            let Some(active) = self.active.as_mut() else {
+                return;
+            };
+            let use_cycles = active.remaining_rcp_cycles.min(d);
+            active.remaining_rcp_cycles -= use_cycles;
+            d -= use_cycles;
+            if active.remaining_rcp_cycles > 0 {
+                return;
+            }
+            let op = self.active.take().unwrap();
+            self.finish_dma(op, rdram, mi);
+        }
+    }
+
+    fn finish_dma(&mut self, op: PiDmaActive, rdram: &mut PhysicalMemory, mi: &mut Mi) {
+        if op.cart_to_rdram {
+            let rdram_mask = (rdram.data.len() as u64).saturating_sub(1);
+            let mut dram = (op.dram_addr as u64) & rdram_mask;
+            for i in 0..op.len {
+                let cart_p = op.cart_addr.wrapping_add(i as u32);
+                let b = self.read_cart_u8(cart_p);
+                let p = (dram as u32) & (rdram_mask as u32);
+                rdram.write_u8(p, b);
+                dram = dram.wrapping_add(1) & rdram_mask;
+            }
+        }
+        self.status = (self.status & !1) | 2;
         mi.raise(MI_INTR_PI);
     }
 
@@ -210,7 +254,11 @@ mod tests {
         pi.dram_addr = 0x0000_0000;
 
         pi.write_reg(PI_REGS_BASE + PI_REG_RD_LEN, 3, &mut rdram, &mut mi);
+        assert!(pi.dma_busy());
+        assert_ne!(rdram.read_u32(0).unwrap(), 0x8037_0012);
 
+        pi.advance_time(1000, &mut rdram, &mut mi);
+        assert!(!pi.dma_busy());
         assert_eq!(rdram.read_u32(0).unwrap(), 0x8037_0012);
         assert_ne!(mi.intr & MI_INTR_PI, 0);
         assert_eq!(pi.read_reg(PI_REGS_BASE + PI_REG_RD_LEN), 3);

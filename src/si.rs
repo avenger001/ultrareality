@@ -1,4 +1,7 @@
 //! Serial Interface (SI): PIF communication and 64-byte DMA to/from PIF RAM.
+//!
+//! `RD64B` / `WR64B` DMA completes after [`SI_DMA_64_BLOCK_CYCLES`] on the RCP timeline; data moves and
+//! `MI_INTR_SI` are deferred until then ([`Si::advance_time`]).
 
 use crate::bus::{Bus, PhysicalMemory};
 use crate::mi::{Mi, MI_INTR_SI};
@@ -20,6 +23,20 @@ pub const SI_REG_STATUS: u32 = 0x18;
 /// RCP cycles charged per 64-byte SI DMA ([`SI_DMA_64_BLOCK_CYCLES`](crate::timing::SI_DMA_64_BLOCK_CYCLES)).
 pub const SI_DMA_CYCLES: u64 = SI_DMA_64_BLOCK_CYCLES;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SiDmaKind {
+    Rd64,
+    Wr64,
+}
+
+#[derive(Debug, Clone)]
+struct SiDmaActive {
+    remaining_rcp_cycles: u64,
+    kind: SiDmaKind,
+    dram_addr: u32,
+    pif_base: usize,
+}
+
 #[derive(Debug)]
 pub struct Si {
     pub dram_addr: u32,
@@ -29,7 +46,7 @@ pub struct Si {
     pub pif_addr_wr: u32,
     /// Bits 0–1: busy during DMA; bit 2: completion (until next DMA starts).
     pub status: u32,
-    pending_cycles: u64,
+    active: Option<SiDmaActive>,
 }
 
 impl Si {
@@ -39,14 +56,13 @@ impl Si {
             pif_addr_rd: 0,
             pif_addr_wr: 0,
             status: 0,
-            pending_cycles: 0,
+            active: None,
         }
     }
 
-    pub fn drain_cycles(&mut self) -> u64 {
-        let c = self.pending_cycles;
-        self.pending_cycles = 0;
-        c
+    #[inline]
+    pub fn dma_busy(&self) -> bool {
+        self.active.is_some()
     }
 
     pub fn offset(paddr: u32) -> Option<u32> {
@@ -75,8 +91,8 @@ impl Si {
         &mut self,
         paddr: u32,
         value: u32,
-        rdram: &mut PhysicalMemory,
-        pif: &mut Pif,
+        _rdram: &mut PhysicalMemory,
+        _pif: &mut Pif,
         mi: &mut Mi,
     ) {
         let Some(off) = Self::offset(paddr) else {
@@ -86,50 +102,89 @@ impl Si {
             SI_REG_DRAM_ADDR => self.dram_addr = value,
             SI_REG_PIF_ADDR_RD64B => {
                 self.pif_addr_rd = value;
-                self.dma_rd64(rdram, pif, mi);
+                self.dma_rd64_kick(value, mi);
             }
             SI_REG_PIF_ADDR_WR64B => {
                 self.pif_addr_wr = value;
-                self.dma_wr64(rdram, pif, mi);
+                self.dma_wr64_kick(value, mi);
             }
             _ => {}
         }
     }
 
-    /// DMA: PIF RAM → RDRAM (64 bytes).
-    fn dma_rd64(&mut self, rdram: &mut PhysicalMemory, pif: &Pif, mi: &mut Mi) {
+    fn dma_rd64_kick(&mut self, pif_addr: u32, mi: &mut Mi) {
+        mi.clear(MI_INTR_SI);
         self.status = (self.status & !4) | 3;
-        let base = pif_ram_byte_index(self.pif_addr_rd);
-        let dram = (self.dram_addr & 0x00FF_FFFF) as usize;
-        let rdram_len = rdram.data.len();
-        for i in 0..PIF_RAM_LEN {
-            let b = pif.ram[base.wrapping_add(i) & (PIF_RAM_LEN - 1)];
-            let p = dram.wrapping_add(i);
-            if p < rdram_len {
-                rdram.write_u8(p as u32, b);
-            }
-        }
-        self.pending_cycles = self.pending_cycles.saturating_add(SI_DMA_CYCLES);
-        self.status = (self.status & !3) | 4;
-        mi.raise(MI_INTR_SI);
+        self.active = Some(SiDmaActive {
+            remaining_rcp_cycles: SI_DMA_64_BLOCK_CYCLES,
+            kind: SiDmaKind::Rd64,
+            dram_addr: self.dram_addr,
+            pif_base: pif_ram_byte_index(pif_addr),
+        });
     }
 
-    /// DMA: RDRAM → PIF RAM (64 bytes).
-    fn dma_wr64(&mut self, rdram: &mut PhysicalMemory, pif: &mut Pif, mi: &mut Mi) {
+    fn dma_wr64_kick(&mut self, pif_addr: u32, mi: &mut Mi) {
+        mi.clear(MI_INTR_SI);
         self.status = (self.status & !4) | 3;
-        let base = pif_ram_byte_index(self.pif_addr_wr);
-        let dram = (self.dram_addr & 0x00FF_FFFF) as usize;
-        let rdram_len = rdram.data.len();
-        for i in 0..PIF_RAM_LEN {
-            let p = dram.wrapping_add(i);
-            let b = if p < rdram_len {
-                rdram.read_u8(p as u32).unwrap_or(0)
-            } else {
-                0
+        self.active = Some(SiDmaActive {
+            remaining_rcp_cycles: SI_DMA_64_BLOCK_CYCLES,
+            kind: SiDmaKind::Wr64,
+            dram_addr: self.dram_addr,
+            pif_base: pif_ram_byte_index(pif_addr),
+        });
+    }
+
+    /// Apply `delta` RCP cycles to in-flight SI DMA; performs the 64-byte transfer and raises `MI_INTR_SI` when due.
+    pub fn advance_time(
+        &mut self,
+        delta: u64,
+        rdram: &mut PhysicalMemory,
+        pif: &mut Pif,
+        mi: &mut Mi,
+    ) {
+        let mut d = delta;
+        while d > 0 {
+            let Some(active) = self.active.as_mut() else {
+                return;
             };
-            pif.ram[base.wrapping_add(i) & (PIF_RAM_LEN - 1)] = b;
+            let use_cycles = active.remaining_rcp_cycles.min(d);
+            active.remaining_rcp_cycles -= use_cycles;
+            d -= use_cycles;
+            if active.remaining_rcp_cycles > 0 {
+                return;
+            }
+            let op = self.active.take().unwrap();
+            self.finish_dma(op, rdram, pif, mi);
         }
-        self.pending_cycles = self.pending_cycles.saturating_add(SI_DMA_CYCLES);
+    }
+
+    fn finish_dma(&mut self, op: SiDmaActive, rdram: &mut PhysicalMemory, pif: &mut Pif, mi: &mut Mi) {
+        match op.kind {
+            SiDmaKind::Rd64 => {
+                let dram = (op.dram_addr & 0x00FF_FFFF) as usize;
+                let rdram_len = rdram.data.len();
+                for i in 0..PIF_RAM_LEN {
+                    let b = pif.ram[op.pif_base.wrapping_add(i) & (PIF_RAM_LEN - 1)];
+                    let p = dram.wrapping_add(i);
+                    if p < rdram_len {
+                        rdram.write_u8(p as u32, b);
+                    }
+                }
+            }
+            SiDmaKind::Wr64 => {
+                let dram = (op.dram_addr & 0x00FF_FFFF) as usize;
+                let rdram_len = rdram.data.len();
+                for i in 0..PIF_RAM_LEN {
+                    let p = dram.wrapping_add(i);
+                    let b = if p < rdram_len {
+                        rdram.read_u8(p as u32).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    pif.ram[op.pif_base.wrapping_add(i) & (PIF_RAM_LEN - 1)] = b;
+                }
+            }
+        }
         self.status = (self.status & !3) | 4;
         mi.raise(MI_INTR_SI);
     }
@@ -160,7 +215,6 @@ mod tests {
         let mut mi = Mi::new();
         pif.ram[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
 
-        // PIF RAM → RDRAM (SI read DMA)
         si.write(SI_REGS_BASE + SI_REG_DRAM_ADDR, 0x0010_0000, &mut rdram, &mut pif, &mut mi);
         si.write(
             SI_REGS_BASE + SI_REG_PIF_ADDR_RD64B,
@@ -170,11 +224,12 @@ mod tests {
             &mut mi,
         );
         assert_eq!(si.read(SI_REGS_BASE + SI_REG_PIF_ADDR_RD64B), PIF_RAM_START);
+        assert!(si.dma_busy());
+        si.advance_time(SI_DMA_64_BLOCK_CYCLES, &mut rdram, &mut pif, &mut mi);
         assert_ne!(mi.intr & MI_INTR_SI, 0);
         mi.clear(MI_INTR_SI);
 
         pif.ram[0..4].fill(0);
-        // RDRAM → PIF RAM (SI write DMA)
         si.write(
             SI_REGS_BASE + SI_REG_PIF_ADDR_WR64B,
             PIF_RAM_START,
@@ -183,6 +238,7 @@ mod tests {
             &mut mi,
         );
         assert_eq!(si.read(SI_REGS_BASE + SI_REG_PIF_ADDR_WR64B), PIF_RAM_START);
+        si.advance_time(SI_DMA_64_BLOCK_CYCLES, &mut rdram, &mut pif, &mut mi);
 
         assert_eq!(&pif.ram[0..4], &0xDEAD_BEEFu32.to_be_bytes());
         assert_ne!(mi.intr & MI_INTR_SI, 0);

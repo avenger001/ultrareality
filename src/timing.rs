@@ -1,9 +1,10 @@
 //! RCP master-clock timing (NTSC).
 //!
 //! The VR4300 and RCP I/O blocks share a **93.75 MHz** system clock on NTSC units. [`Machine`](crate::Machine)
-//! advances [`SystemBus::drain_deferred_cycles`](crate::bus::SystemBus::drain_deferred_cycles) and
-//! [`Vi::advance`](crate::vi::Vi::advance) in **RCP cycles** so the VI frame counter and device DMA
-//! costs stay on one timeline.
+//! advances [`SystemBus::rcp_advance_dma_in_flight`](crate::bus::SystemBus::rcp_advance_dma_in_flight),
+//! [`SystemBus::drain_deferred_cycles`](crate::bus::SystemBus::drain_deferred_cycles), and
+//! [`Vi::advance`](crate::vi::Vi::advance) in **RCP cycles** so the VI frame counter, PI/SI/AI DMA,
+//! and other deferred work share one timeline.
 //!
 //! Values here are **first-order** models: PI cart throughput follows published ~5 MiB/s averages;
 //! SI and AI use conservative stand-ins until measured against hardware or test ROMs (e.g.

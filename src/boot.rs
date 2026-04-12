@@ -47,6 +47,8 @@ pub fn cart_boot_pc(rom: &[u8]) -> Option<u64> {
 
 /// IPL3-style load: first **1 MiB** of game ROM from cart offset `0x1000` into RDRAM at the physical
 /// address of the boot PC from the header (`0x08`), using PI “read” DMA (not a host `memcpy`).
+/// The transfer is timed like hardware; [`Pi::dma_cart_segment_to_rdram`] fast-forwards the RCP clock
+/// so RDRAM is filled before the CPU runs.
 pub fn ipl3_load_via_pi_dma(pi: &mut Pi, rdram: &mut PhysicalMemory, mi: &mut Mi) -> Option<u64> {
     let pc = cart_boot_pc(&pi.rom)?;
     let dst_phys = virt_to_phys(pc)? as usize;

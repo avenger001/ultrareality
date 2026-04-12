@@ -191,17 +191,20 @@ impl SystemBus {
         self.vi.charge_framebuffer_fetch_rgba16_pixels(px);
     }
 
-    pub fn drain_pi_cycles(&mut self) -> u64 {
-        self.pi.drain_cycles()
+    /// RDP list processing and VI framebuffer read cycle debt folded into the next retired instruction.
+    /// PI / SI / AI DMA completion is timed separately via [`Self::rcp_advance_dma_in_flight`].
+    pub fn drain_deferred_cycles(&mut self) -> u64 {
+        self.vi
+            .drain_fetch_debt()
+            .saturating_add(std::mem::take(&mut self.rdp_deferred_cycles))
     }
 
-    /// PI / SI / AI DMA, RDP list processing, and VI framebuffer read cycle debt folded into the next retired instruction.
-    pub fn drain_deferred_cycles(&mut self) -> u64 {
-        self.drain_pi_cycles()
-            .saturating_add(self.si.drain_cycles())
-            .saturating_add(self.ai.drain_cycles())
-            .saturating_add(self.vi.drain_fetch_debt())
-            .saturating_add(std::mem::take(&mut self.rdp_deferred_cycles))
+    /// Advance in-flight PI / SI / AI DMA by `delta` RCP cycles (same quantum as the current CPU step).
+    pub fn rcp_advance_dma_in_flight(&mut self, delta: u64) {
+        self.pi.advance_time(delta, &mut self.rdram, &mut self.mi);
+        self.si
+            .advance_time(delta, &mut self.rdram, &mut self.pif, &mut self.mi);
+        self.ai.advance_time(delta, &mut self.mi);
     }
 
     /// NTSC VI line: accumulate cycles and raise `MI_INTR_VI` each frame (stub).
@@ -616,6 +619,9 @@ mod tests {
         let mut bus = SystemBus::with_rdram_size(1024 * 1024);
         bus.mi.mask = MI_INTR_AI;
         bus.write_u32(AI_REGS_BASE + AI_REG_LEN, 0x1000);
+        assert!(!bus.mi.cpu_irq_pending());
+        let need = crate::timing::ai_pcm_buffer_cycles(0x1000);
+        bus.rcp_advance_dma_in_flight(need);
         assert!(bus.mi.cpu_irq_pending());
     }
 
