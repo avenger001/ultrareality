@@ -16,9 +16,11 @@ pub mod machine;
 pub mod mi;
 pub mod pi;
 pub mod pif;
+pub mod present;
 pub mod rcp;
 pub mod rdp;
 pub mod ri;
+pub mod rsp;
 pub mod si;
 pub mod timing;
 pub mod vi;
@@ -38,8 +40,8 @@ pub use mi::{
     MI_REG_INTR_MASK, MI_REG_MODE, MI_REG_VERSION, MI_REGS_BASE, MI_REGS_LEN, MI_VERSION_DEFAULT,
 };
 pub use pi::{
-    Pi, CART_DOM1_ADDR2_BASE, CART_ROM_TEST_DWORD_OFF, PI_REG_CART_ADDR, PI_REG_DRAM_ADDR,
-    PI_REG_RD_LEN, PI_REG_WR_LEN, PI_REGS_BASE, PI_REGS_LEN,
+    Pi, CART_DOM1_ADDR2_BASE, CART_ROM_TEST_DWORD_OFF, PI_REG_BSD_DOM1_LAT, PI_REG_CART_ADDR,
+    PI_REG_DRAM_ADDR, PI_REG_RD_LEN, PI_REG_WR_LEN, PI_REGS_BASE, PI_REGS_LEN,
 };
 pub use pif::{Pif, PifRomLoadError, PIF_KSEG1_RESET_PC, PIF_ROM_LEN};
 pub use ri::{
@@ -63,5 +65,11 @@ pub use vi::{
     VI_OFF_V_SYNC, VI_OFF_V_VIDEO, VI_OFF_WIDTH, VI_OFF_X_SCALE, VI_OFF_Y_SCALE, VI_REG_ORIGIN,
     VI_REG_WIDTH, VI_REGS_BASE, VI_REGS_LEN, VI_RDRAM_CYCLES_PER_BYTE,
 };
-pub use timing::{ai_pcm_buffer_cycles, pi_cart_dma_total_cycles, RCP_MASTER_HZ_NTSC};
-pub use video::{blit_rgba5551, pixel_rgba5551_to_argb};
+pub use timing::{
+    ai_pcm_buffer_cycles, pi_cart_dma_total_cycles, sp_rsp_dma_total_cycles, RCP_MASTER_HZ_NTSC,
+};
+pub use present::{
+    graphics_phase_reached, run_wgpu_loop, GraphicsPhase, PresentError, WgpuPresenter,
+};
+pub use video::{blit_rgba5551, blit_rgba5551_to_rgba8, pixel_rgba5551_to_argb};
+pub use rsp::{Rsp, RspState};

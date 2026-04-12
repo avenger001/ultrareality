@@ -106,7 +106,7 @@ mod tests {
         KSEG0_INTERRUPT_VECTOR_PC, MIPS_OPCODE_BREAK, STATUS_EXL, STATUS_IE,
     };
     use crate::ai::{AI_REG_LEN, AI_REGS_BASE};
-    use crate::timing::{ai_pcm_buffer_cycles, pi_cart_dma_total_cycles};
+    use crate::timing::{ai_pcm_buffer_cycles, sp_rsp_dma_total_cycles};
     use crate::si::SI_DMA_CYCLES;
 
     /// Test RDRAM destinations for PI/SI DMA integration tests (physical).
@@ -116,6 +116,7 @@ mod tests {
         MI_INTR_AI, MI_INTR_DP, MI_INTR_PI, MI_INTR_SI, MI_INTR_SP, MI_INTR_VI,
     };
     use crate::rcp::{DPC_REG_END, DPC_REGS_BASE, SP_REG_RD_LEN, SP_REGS_BASE};
+    use crate::rdp::Rdp;
 
     #[test]
     fn mi_interrupt_delivers_to_handler_vector() {
@@ -180,8 +181,8 @@ mod tests {
         m.bus.write_u32(PI_REGS_BASE + PI_REG_RD_LEN, 3);
 
         assert_eq!(m.bus.mi.intr & MI_INTR_PI, 0);
-        m.bus
-            .rcp_advance_dma_in_flight(pi_cart_dma_total_cycles(4));
+        let pi_cost = m.bus.pi.cart_dma_cost_cycles(4);
+        m.bus.rcp_advance_dma_in_flight(pi_cost);
         assert_ne!(m.bus.mi.intr & MI_INTR_PI, 0);
         assert_eq!(
             m.bus.rdram.read_u32(RDRAM_TEST_PI_DST).unwrap(),
@@ -267,6 +268,9 @@ mod tests {
 
         m.bus.write_u32(SP_REGS_BASE + SP_REG_RD_LEN, 0x200);
 
+        assert_eq!(m.bus.mi.intr & MI_INTR_SP, 0);
+        m.bus
+            .rcp_advance_dma_in_flight(sp_rsp_dma_total_cycles(0x200));
         assert_ne!(m.bus.mi.intr & MI_INTR_SP, 0);
         m.step().unwrap();
         assert_eq!(m.cpu.pc, KSEG0_INTERRUPT_VECTOR_PC);
@@ -288,6 +292,9 @@ mod tests {
 
         m.bus.write_u32(DPC_REGS_BASE + DPC_REG_END, 0x0010_0000);
 
+        assert_eq!(m.bus.mi.intr & MI_INTR_DP, 0);
+        let est = Rdp::estimate_display_list_cycles(0, 0x0010_0000);
+        m.bus.rcp_advance_dma_in_flight(est);
         assert_ne!(m.bus.mi.intr & MI_INTR_DP, 0);
         m.step().unwrap();
         assert_eq!(m.cpu.pc, KSEG0_INTERRUPT_VECTOR_PC);

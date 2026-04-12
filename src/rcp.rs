@@ -220,13 +220,9 @@ impl DpcRegs {
             DPC_REG_END => {
                 self.end = dpc_addr_mask(value);
                 if value != 0 {
-                    self.current = self.end;
-                    self.status &= !(DPC_STATUS_DMA_BUSY
-                        | DPC_STATUS_END_PENDING
-                        | DPC_STATUS_START_PENDING
-                        | DPC_STATUS_CMD_BUSY
-                        | DPC_STATUS_PIPE_BUSY
-                        | DPC_STATUS_TMEM_BUSY);
+                    // Deferred RDP: list runs when [`crate::bus::SystemBus`] finishes the countdown;
+                    // `current` is updated then via [`Self::mark_display_list_complete`].
+                    self.status = (self.status & !DPC_STATUS_START_PENDING) | DPC_STATUS_DMA_BUSY | DPC_STATUS_END_PENDING;
                     Some(DpcEndKick {
                         start: self.start,
                         end: self.end,
@@ -258,6 +254,18 @@ impl DpcRegs {
 impl Default for DpcRegs {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl DpcRegs {
+    /// Call after [`crate::rdp::Rdp::process_display_list`] completes for a deferred `DPC_END`.
+    pub fn mark_display_list_complete(&mut self, end_masked: u32) {
+        self.current = dpc_addr_mask(end_masked);
+        self.status &= !(DPC_STATUS_DMA_BUSY
+            | DPC_STATUS_END_PENDING
+            | DPC_STATUS_CMD_BUSY
+            | DPC_STATUS_PIPE_BUSY
+            | DPC_STATUS_TMEM_BUSY);
     }
 }
 
@@ -298,10 +306,13 @@ mod tests {
     }
 
     #[test]
-    fn dpc_end_sets_current_instant_complete() {
+    fn dpc_end_defers_current_until_complete() {
         let mut dpc = DpcRegs::new();
         dpc.write(DPC_REGS_BASE + DPC_REG_START, 0x8012_3000);
         dpc.write(DPC_REGS_BASE + DPC_REG_END, 0x8012_3458);
+        assert_eq!(dpc.read(DPC_REGS_BASE + DPC_REG_CURRENT), 0);
+        assert_ne!(dpc.read(DPC_REGS_BASE + DPC_REG_STATUS) & DPC_STATUS_DMA_BUSY, 0);
+        dpc.mark_display_list_complete(0x8012_3458);
         assert_eq!(dpc.read(DPC_REGS_BASE + DPC_REG_CURRENT), 0x8012_3458 & 0x00FF_FFF8);
         assert_eq!(
             dpc.read(DPC_REGS_BASE + DPC_REG_STATUS) & DPC_STATUS_DMA_BUSY,

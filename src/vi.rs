@@ -61,6 +61,8 @@ pub struct Vi {
     pub frame_counter: u64,
     /// Master-cycle debt for reading the framebuffer from RDRAM (billed via [`crate::bus::SystemBus::drain_deferred_cycles`]).
     pub fetch_debt: u64,
+    /// Avoid re-raising `MI_INTR_VI` for the same `VI_V_INTR` line crossing within one field.
+    v_line_intr_latched: bool,
 }
 
 impl Vi {
@@ -70,7 +72,19 @@ impl Vi {
             cycle_in_frame: 0,
             frame_counter: 0,
             fetch_debt: 0,
+            v_line_intr_latched: false,
         }
+    }
+
+    /// RCP cycle offset within the field for `VI_V_INTR` (half-line / line interrupt). `None` if disabled.
+    #[inline]
+    pub fn v_intr_cycle_offset(&self) -> Option<u64> {
+        let v = self.regs[VI_REG_V_INTR] & 0x3FF;
+        if v == 0 {
+            return None;
+        }
+        let line = (v as u64).min(VI_NTSC_SCANLINES - 1);
+        Some(line.saturating_mul(VI_NTSC_CYCLES_PER_FRAME) / VI_NTSC_SCANLINES)
     }
 
     /// Schedule RDRAM bandwidth cost for reading `pixels` RGBA5551 texels (2 bytes each) for display.
@@ -85,12 +99,21 @@ impl Vi {
         std::mem::take(&mut self.fetch_debt)
     }
 
-    /// Add retired cycles; when a frame elapses, raise `MI_INTR_VI` (stub timing).
+    /// Add retired cycles; optional mid-field interrupt from `VI_V_INTR`, then field `MI_INTR_VI` at frame end.
     pub fn advance(&mut self, cycles: u64, mi: &mut Mi) {
-        self.cycle_in_frame = self.cycle_in_frame.saturating_add(cycles);
+        let start = self.cycle_in_frame;
+        let end = start.saturating_add(cycles);
+        if let Some(t) = self.v_intr_cycle_offset() {
+            if !self.v_line_intr_latched && start < t && end >= t {
+                self.v_line_intr_latched = true;
+                mi.raise(MI_INTR_VI);
+            }
+        }
+        self.cycle_in_frame = end;
         while self.cycle_in_frame >= VI_NTSC_CYCLES_PER_FRAME {
             self.cycle_in_frame -= VI_NTSC_CYCLES_PER_FRAME;
             self.frame_counter = self.frame_counter.wrapping_add(1);
+            self.v_line_intr_latched = false;
             mi.raise(MI_INTR_VI);
         }
     }
@@ -138,6 +161,9 @@ impl Vi {
         }
         if let Some(r) = self.regs.get_mut(i) {
             *r = value;
+        }
+        if i == VI_REG_V_INTR {
+            self.v_line_intr_latched = false;
         }
     }
 
@@ -209,5 +235,18 @@ mod tests {
     fn vi_off_aliases_match_vi_reg_byte_off() {
         assert_eq!(VI_OFF_ORIGIN, vi_reg_byte_off(VI_REG_ORIGIN));
         assert_eq!(VI_OFF_V_CURRENT, 0x10);
+    }
+
+    #[test]
+    fn v_intr_triggers_mid_field_mi() {
+        let mut vi = Vi::new();
+        let mut mi = Mi::new();
+        mi.mask = MI_INTR_VI;
+        vi.regs[VI_REG_V_INTR] = 128;
+        let t = vi.v_intr_cycle_offset().expect("line intr");
+        vi.advance(t.saturating_sub(1), &mut mi);
+        assert!(!mi.cpu_irq_pending());
+        vi.advance(1, &mut mi);
+        assert!(mi.cpu_irq_pending());
     }
 }

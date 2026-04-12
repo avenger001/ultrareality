@@ -6,8 +6,8 @@ use crate::pif::{Pif, PIF_ROM_START, PIF_WINDOW_END};
 use crate::pi::{Pi, CART_DOM1_ADDR2_BASE, PI_REGS_BASE, PI_REGS_LEN};
 use crate::ri::{Ri, RI_REGS_BASE, RI_REGS_LEN};
 use crate::rcp::{
-    sp_dma_decode, sp_dma_end_addresses, DpcRegs, SpRegs, DPC_REGS_BASE, DPC_REGS_LEN,
-    SP_PC_REG_IBIST, SP_PC_REG_PC, SP_PC_REGS_BASE, SP_PC_REGS_LEN, SP_REG_DMA_BUSY,
+    sp_dma_decode, sp_dma_end_addresses, DpcEndKick, DpcRegs, SpRegs, DPC_REGS_BASE,
+    DPC_REGS_LEN, SP_PC_REG_IBIST, SP_PC_REG_PC, SP_PC_REGS_BASE, SP_PC_REGS_LEN, SP_REG_DMA_BUSY,
     SP_REG_DMA_FULL, SP_REG_RD_LEN, SP_REG_SEMAPHORE,
     SP_REG_STATUS, SP_REG_WR_LEN, SP_REGS_BASE, SP_REGS_LEN, SP_WORD_DRAM_ADDR, SP_WORD_MEM_ADDR,
 };
@@ -108,6 +108,21 @@ pub fn virt_to_phys_rdram(vaddr: u64, rdram_size: usize) -> Option<u32> {
     }
 }
 
+#[derive(Debug)]
+struct SpDmaPending {
+    remaining_rcp_cycles: u64,
+    len_reg: u32,
+    mem: u32,
+    dram: u32,
+    to_rsp: bool,
+}
+
+#[derive(Debug)]
+struct DpcRdpPending {
+    remaining_rcp_cycles: u64,
+    kick: DpcEndKick,
+}
+
 /// Full physical map: RDRAM, RSP, RCP MMIO, RI, PI, cartridge ROM, PIF.
 pub struct SystemBus {
     pub rdram: PhysicalMemory,
@@ -134,6 +149,8 @@ pub struct SystemBus {
     pub rsp_pc: u32,
     /// `SP_IBIST` — stub storage for bring-up.
     pub rsp_ibist: u32,
+    sp_dma_pending: Option<SpDmaPending>,
+    dpc_rdp_pending: Option<DpcRdpPending>,
 }
 
 impl SystemBus {
@@ -158,6 +175,8 @@ impl SystemBus {
             sp_semaphore: 0,
             rsp_pc: 0,
             rsp_ibist: 0,
+            sp_dma_pending: None,
+            dpc_rdp_pending: None,
         }
     }
 
@@ -182,6 +201,8 @@ impl SystemBus {
             sp_semaphore: 0,
             rsp_pc: 0,
             rsp_ibist: 0,
+            sp_dma_pending: None,
+            dpc_rdp_pending: None,
         }
     }
 
@@ -191,20 +212,70 @@ impl SystemBus {
         self.vi.charge_framebuffer_fetch_rgba16_pixels(px);
     }
 
-    /// RDP list processing and VI framebuffer read cycle debt folded into the next retired instruction.
-    /// PI / SI / AI DMA completion is timed separately via [`Self::rcp_advance_dma_in_flight`].
+    /// RDP list **processing** cycle debt (applied when a deferred `DPC_END` completes) and VI framebuffer
+    /// read debt. SP DMA completion is timed via [`Self::rcp_advance_dma_in_flight`]; PI/SI/AI likewise.
     pub fn drain_deferred_cycles(&mut self) -> u64 {
         self.vi
             .drain_fetch_debt()
             .saturating_add(std::mem::take(&mut self.rdp_deferred_cycles))
     }
 
-    /// Advance in-flight PI / SI / AI DMA by `delta` RCP cycles (same quantum as the current CPU step).
+    /// Advance in-flight PI / SI / AI / SP / DPC work by `delta` RCP cycles (same quantum as the current CPU step).
     pub fn rcp_advance_dma_in_flight(&mut self, delta: u64) {
         self.pi.advance_time(delta, &mut self.rdram, &mut self.mi);
         self.si
             .advance_time(delta, &mut self.rdram, &mut self.pif, &mut self.mi);
         self.ai.advance_time(delta, &mut self.mi);
+        self.advance_sp_dma(delta);
+        self.advance_dpc_rdp(delta);
+    }
+
+    fn advance_sp_dma(&mut self, mut delta: u64) {
+        while delta > 0 {
+            let Some(p) = self.sp_dma_pending.as_mut() else {
+                return;
+            };
+            let u = p.remaining_rcp_cycles.min(delta);
+            p.remaining_rcp_cycles -= u;
+            delta -= u;
+            if p.remaining_rcp_cycles > 0 {
+                return;
+            }
+            let job = self.sp_dma_pending.take().unwrap();
+            if job.to_rsp {
+                self.sp_dma_rdram_to_rsp_inner(job.len_reg, job.mem, job.dram);
+            } else {
+                self.sp_dma_rsp_to_rdram_inner(job.len_reg, job.mem, job.dram);
+            }
+            self.mi.raise(MI_INTR_SP);
+        }
+    }
+
+    fn advance_dpc_rdp(&mut self, mut delta: u64) {
+        while delta > 0 {
+            let Some(p) = self.dpc_rdp_pending.as_mut() else {
+                return;
+            };
+            let u = p.remaining_rcp_cycles.min(delta);
+            p.remaining_rcp_cycles -= u;
+            delta -= u;
+            if p.remaining_rcp_cycles > 0 {
+                return;
+            }
+            let job = self.dpc_rdp_pending.take().unwrap();
+            let k = job.kick;
+            let c = self.rdp.process_display_list(
+                &mut self.rdram.data,
+                &self.rsp_dmem[..],
+                &self.rsp_imem[..],
+                k.start,
+                k.end,
+                self.dpc_regs.status,
+            );
+            self.rdp_deferred_cycles = self.rdp_deferred_cycles.saturating_add(c);
+            self.dpc_regs.mark_display_list_complete(k.end);
+            self.mi.raise(MI_INTR_DP);
+        }
     }
 
     /// NTSC VI line: accumulate cycles and raise `MI_INTR_VI` each frame (stub).
@@ -232,14 +303,8 @@ impl SystemBus {
         }
     }
 
-    /// RDRAM → RSP DMEM/IMEM (`SP_RD_LEN` write). Uses `SP_MEM_ADDR` / `SP_DRAM_ADDR` already in [`SpRegs`].
-    ///
-    /// Multi-line DMA packs bytes contiguously into RSP memory (13-bit linear DMEM+IMEM, wrapping at 8 KiB),
-    /// while advancing RDRAM by an extra `skip` after each line ([mupen-style](https://github.com/mupen64plus/mupen64plus-core)).
-    fn sp_dma_rdram_to_rsp(&mut self, len_reg: u32) {
+    fn sp_dma_rdram_to_rsp_inner(&mut self, len_reg: u32, mem: u32, dram: u32) {
         let (line_bytes, line_count, dram_skip) = sp_dma_decode(len_reg);
-        let mem = self.sp_regs.words[SP_WORD_MEM_ADDR];
-        let dram = self.sp_regs.words[SP_WORD_DRAM_ADDR];
         let mut dram_p = (dram & 0x00FF_FFFF) as usize;
         let mut sp_flat =
             (((mem & 0x1000) != 0) as usize).saturating_mul(0x1000) + (mem & 0xFFF) as usize;
@@ -264,11 +329,8 @@ impl SystemBus {
         self.sp_regs.words[SP_WORD_DRAM_ADDR] = new_dram;
     }
 
-    /// RSP DMEM/IMEM → RDRAM (`SP_WR_LEN` write).
-    fn sp_dma_rsp_to_rdram(&mut self, len_reg: u32) {
+    fn sp_dma_rsp_to_rdram_inner(&mut self, len_reg: u32, mem: u32, dram: u32) {
         let (line_bytes, line_count, dram_skip) = sp_dma_decode(len_reg);
-        let mem = self.sp_regs.words[SP_WORD_MEM_ADDR];
-        let dram = self.sp_regs.words[SP_WORD_DRAM_ADDR];
         let mut dram_p = (dram & 0x00FF_FFFF) as usize;
         let mut sp_flat =
             (((mem & 0x1000) != 0) as usize).saturating_mul(0x1000) + (mem & 0xFFF) as usize;
@@ -325,7 +387,8 @@ impl SystemBus {
         let off = paddr.wrapping_sub(SP_REGS_BASE);
         match off {
             SP_REG_STATUS => self.sp_status_read(),
-            SP_REG_DMA_FULL | SP_REG_DMA_BUSY => 0,
+            SP_REG_DMA_FULL => 0,
+            SP_REG_DMA_BUSY => u32::from(self.sp_dma_pending.is_some()),
             SP_REG_SEMAPHORE => {
                 let r = self.sp_semaphore & 1;
                 self.sp_semaphore = 1;
@@ -346,15 +409,31 @@ impl SystemBus {
             SP_REG_RD_LEN => {
                 self.sp_regs.store_u32(paddr, value);
                 if value != 0 {
-                    self.sp_dma_rdram_to_rsp(value);
-                    self.mi.raise(MI_INTR_SP);
+                    self.mi.clear(MI_INTR_SP);
+                    let mem = self.sp_regs.words[SP_WORD_MEM_ADDR];
+                    let dram = self.sp_regs.words[SP_WORD_DRAM_ADDR];
+                    self.sp_dma_pending = Some(SpDmaPending {
+                        remaining_rcp_cycles: crate::timing::sp_rsp_dma_total_cycles(value),
+                        len_reg: value,
+                        mem,
+                        dram,
+                        to_rsp: true,
+                    });
                 }
             }
             SP_REG_WR_LEN => {
                 self.sp_regs.store_u32(paddr, value);
                 if value != 0 {
-                    self.sp_dma_rsp_to_rdram(value);
-                    self.mi.raise(MI_INTR_SP);
+                    self.mi.clear(MI_INTR_SP);
+                    let mem = self.sp_regs.words[SP_WORD_MEM_ADDR];
+                    let dram = self.sp_regs.words[SP_WORD_DRAM_ADDR];
+                    self.sp_dma_pending = Some(SpDmaPending {
+                        remaining_rcp_cycles: crate::timing::sp_rsp_dma_total_cycles(value),
+                        len_reg: value,
+                        mem,
+                        dram,
+                        to_rsp: false,
+                    });
                 }
             }
             _ => {
@@ -499,16 +578,12 @@ impl Bus for SystemBus {
         }
         if (DPC_REGS_BASE..DPC_REGS_BASE + DPC_REGS_LEN as u32).contains(&paddr) {
             if let Some(k) = self.dpc_regs.write(paddr, value) {
-                let c = self.rdp.process_display_list(
-                    &mut self.rdram.data,
-                    &self.rsp_dmem[..],
-                    &self.rsp_imem[..],
-                    k.start,
-                    k.end,
-                    self.dpc_regs.status,
-                );
-                self.rdp_deferred_cycles = self.rdp_deferred_cycles.saturating_add(c);
-                self.mi.raise(MI_INTR_DP);
+                self.mi.clear(MI_INTR_DP);
+                let est = Rdp::estimate_display_list_cycles(k.start, k.end);
+                self.dpc_rdp_pending = Some(DpcRdpPending {
+                    remaining_rcp_cycles: est,
+                    kick: k,
+                });
             }
             return;
         }
@@ -596,6 +671,7 @@ mod tests {
         SP_PC_REG_IBIST, SP_PC_REGS_BASE, SP_REG_DRAM_ADDR, SP_REG_MEM_ADDR, SP_REG_RD_LEN,
         SP_REG_SEMAPHORE, SP_REG_STATUS, SP_REGS_BASE,
     };
+    use crate::rdp::Rdp;
     use crate::ri::{RI_MODE_DEFAULT, RI_REG_MODE, RI_REGS_BASE};
     use crate::vi::{VI_OFF_ORIGIN, VI_REG_ORIGIN, VI_REGS_BASE};
 
@@ -657,6 +733,9 @@ mod tests {
         bus.mi.intr = 0;
         bus.write_u32(DPC_REGS_BASE + DPC_REG_START, base as u32);
         bus.write_u32(DPC_REGS_BASE + DPC_REG_END, (base + 24) as u32);
+        assert_eq!(bus.mi.intr & crate::mi::MI_INTR_DP, 0);
+        let est = Rdp::estimate_display_list_cycles(base as u32, (base + 24) as u32);
+        bus.rcp_advance_dma_in_flight(est);
         assert_ne!(bus.mi.intr & crate::mi::MI_INTR_DP, 0);
 
         let off = origin as usize + (1usize * 320 + 1) * 2;
@@ -674,6 +753,8 @@ mod tests {
         bus.write_u32(SP_REGS_BASE + SP_REG_MEM_ADDR, 0x0400_0000);
         bus.write_u32(SP_REGS_BASE + SP_REG_DRAM_ADDR, 0x0000_0100);
         bus.write_u32(SP_REGS_BASE + SP_REG_RD_LEN, 3);
+        assert_eq!(&bus.rsp_dmem[0..4], &[0, 0, 0, 0]);
+        bus.rcp_advance_dma_in_flight(crate::timing::sp_rsp_dma_total_cycles(3));
         assert_eq!(&bus.rsp_dmem[0..4], &[0xAA, 0xBB, 0xCC, 0xDD]);
         assert_ne!(bus.mi.intr & MI_INTR_SP, 0);
     }
@@ -686,6 +767,7 @@ mod tests {
         bus.write_u32(SP_REGS_BASE + SP_REG_MEM_ADDR, 0x0400_0000);
         bus.write_u32(SP_REGS_BASE + SP_REG_DRAM_ADDR, 0x0000_0100);
         bus.write_u32(SP_REGS_BASE + SP_REG_RD_LEN, 3);
+        bus.rcp_advance_dma_in_flight(crate::timing::sp_rsp_dma_total_cycles(3));
         assert_eq!(bus.sp_regs.words[0], 0x0400_0004);
         assert_eq!(bus.sp_regs.words[1], 0x0000_0104);
     }
@@ -732,6 +814,7 @@ mod tests {
         bus.write_u32(SP_REGS_BASE + SP_REG_MEM_ADDR, 0x0400_0000);
         bus.write_u32(SP_REGS_BASE + SP_REG_DRAM_ADDR, 0x0000_0200);
         bus.write_u32(SP_REGS_BASE + SP_REG_WR_LEN, 3);
+        bus.rcp_advance_dma_in_flight(crate::timing::sp_rsp_dma_total_cycles(3));
         assert_eq!(&bus.rdram.data[0x200..0x204], &[0x11, 0x22, 0x33, 0x44]);
         assert_ne!(bus.mi.intr & MI_INTR_SP, 0);
     }
@@ -748,6 +831,7 @@ mod tests {
         bus.write_u32(SP_REGS_BASE + SP_REG_MEM_ADDR, 0x0400_0000);
         bus.write_u32(SP_REGS_BASE + SP_REG_DRAM_ADDR, 0x0000_0300);
         bus.write_u32(SP_REGS_BASE + SP_REG_RD_LEN, 0x0080_1001);
+        bus.rcp_advance_dma_in_flight(crate::timing::sp_rsp_dma_total_cycles(0x0080_1001));
         assert_eq!(&bus.rsp_dmem[0..4], &[0x10, 0x11, 0xaa, 0xbb]);
         assert_ne!(bus.mi.intr & MI_INTR_SP, 0);
     }

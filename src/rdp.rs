@@ -197,6 +197,21 @@ impl Rdp {
         self.last_list_cycles = cycles;
         cycles
     }
+
+    /// Lower-bound RCP cycles before the list can finish (used to schedule deferred `DPC_END` completion).
+    pub fn estimate_display_list_cycles(start: u32, end: u32) -> u64 {
+        let s = (start & 0x00FF_FFF8) as u64;
+        let e = (end & 0x00FF_FFF8) as u64;
+        if e <= s {
+            return 40;
+        }
+        let len = e - s;
+        let cmds = (len / 8).max(1);
+        len
+            .saturating_mul(RDRAM_CYCLES_PER_BYTE)
+            .saturating_add(cmds.saturating_mul(RDP_CYCLES_PER_CMD))
+            .max(1)
+    }
 }
 
 #[inline]

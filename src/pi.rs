@@ -24,6 +24,8 @@ pub const PI_REG_CART_ADDR: u32 = 0x04;
 pub const PI_REG_RD_LEN: u32 = 0x0C;
 /// RDRAM → cart DMA “write”; write starts transfer. **Read** at `0x10` is [`Pi::status`] (`PI_STATUS`).
 pub const PI_REG_WR_LEN: u32 = 0x10;
+/// `PI_BSD_DOM1_LAT` — cart bus latency (cycles − 1 after address); affects DMA scheduling ([n64brew](https://n64brew.dev/wiki/Parallel_Interface)).
+pub const PI_REG_BSD_DOM1_LAT: u32 = 0x14;
 
 /// RCP cycles per byte for PI cart ROM DMA ([`PI_ROM_DMA_CYCLES_PER_BYTE`](crate::timing::PI_ROM_DMA_CYCLES_PER_BYTE)).
 pub const PI_CYCLES_PER_DMA_BYTE: u64 = PI_ROM_DMA_CYCLES_PER_BYTE;
@@ -48,6 +50,8 @@ pub struct Pi {
     pub wr_len: u32,
     /// Minimal status: bit0 = DMA busy, bit1 = interrupt (completion).
     pub status: u32,
+    /// Default retail ~64 (`LAT` field = 65 RCP cycles before first chunk); IPL may reprogram via ROM header.
+    pub bsd_dom1_lat: u8,
     active: Option<PiDmaActive>,
 }
 
@@ -60,6 +64,7 @@ impl Pi {
             rd_len: 0,
             wr_len: 0,
             status: 0,
+            bsd_dom1_lat: 64,
             active: None,
         }
     }
@@ -72,8 +77,21 @@ impl Pi {
             rd_len: 0,
             wr_len: 0,
             status: 0,
+            bsd_dom1_lat: 64,
             active: None,
         }
+    }
+
+    fn transfer_cost_cycles(&self, byte_len: u64) -> u64 {
+        let base = pi_cart_dma_total_cycles(byte_len);
+        let chunks = (byte_len + 127) / 128;
+        let lat = self.bsd_dom1_lat as u64;
+        base.saturating_add(chunks.saturating_mul(lat.saturating_add(1)))
+    }
+
+    /// RCP cycles until a cart↔RDRAM DMA of `byte_len` bytes completes at the current `bsd_dom1_lat`.
+    pub fn cart_dma_cost_cycles(&self, byte_len: u64) -> u64 {
+        self.transfer_cost_cycles(byte_len)
     }
 
     /// True while a PI DMA is in flight (matches `PI_STATUS` bit0).
@@ -99,6 +117,7 @@ impl Pi {
             PI_REG_CART_ADDR => self.cart_addr,
             PI_REG_RD_LEN => self.rd_len & 0x00FF_FFFF,
             PI_REG_WR_LEN => self.status,
+            PI_REG_BSD_DOM1_LAT => self.bsd_dom1_lat as u32,
             _ => 0,
         }
     }
@@ -118,6 +137,7 @@ impl Pi {
                 self.wr_len = value & 0x00FF_FFFF;
                 self.dma_write_kick(self.wr_len, mi);
             }
+            PI_REG_BSD_DOM1_LAT => self.bsd_dom1_lat = (value & 0xFF) as u8,
             _ => {}
         }
     }
@@ -148,7 +168,7 @@ impl Pi {
         }
         mi.clear(MI_INTR_PI);
         self.status = (self.status & !2) | 1;
-        let cost = pi_cart_dma_total_cycles(len);
+        let cost = self.transfer_cost_cycles(len);
         self.active = Some(PiDmaActive {
             remaining_rcp_cycles: cost,
             cart_addr: self.cart_addr,
@@ -165,7 +185,7 @@ impl Pi {
         }
         mi.clear(MI_INTR_PI);
         self.status = (self.status & !2) | 1;
-        let cost = pi_cart_dma_total_cycles(len);
+        let cost = self.transfer_cost_cycles(len);
         self.active = Some(PiDmaActive {
             remaining_rcp_cycles: cost,
             cart_addr: self.cart_addr,

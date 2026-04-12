@@ -10,6 +10,8 @@
 //! SI and AI use conservative stand-ins until measured against hardware or test ROMs (e.g.
 //! [n64_pi_dma_test](https://github.com/rasky/n64_pi_dma_test)).
 
+use crate::rcp::sp_dma_decode;
+
 /// NTSC CPU / RCP I/O master frequency (Hz).
 pub const RCP_MASTER_HZ_NTSC: u64 = 93_750_000;
 
@@ -55,6 +57,20 @@ pub fn ai_pcm_buffer_cycles(byte_len: u32) -> u64 {
     len.saturating_mul(RCP_MASTER_HZ_NTSC) / AI_PCM_BYTES_PER_SEC
 }
 
+// --- RSP SP DMA (RDRAM ↔ DMEM/IMEM) -----------------------------------------
+
+/// Fixed cost before byte pipeline (rough; see hcs64 RSP DMA measurements).
+pub const SP_RSP_DMA_OVERHEAD_CYCLES: u64 = 40;
+/// RCP cycles per byte transferred (simplified linear model).
+pub const SP_RSP_CYCLES_PER_BYTE: u64 = 1;
+
+#[inline]
+pub fn sp_rsp_dma_total_cycles(len_reg: u32) -> u64 {
+    let (line_bytes, line_count, _) = sp_dma_decode(len_reg);
+    let bytes = (line_bytes as u64).saturating_mul(line_count as u64);
+    SP_RSP_DMA_OVERHEAD_CYCLES.saturating_add(bytes.saturating_mul(SP_RSP_CYCLES_PER_BYTE))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +85,10 @@ mod tests {
     fn ai_buffer_cycles_order_of_one_frame_44k_stereo() {
         let one_sec = ai_pcm_buffer_cycles(AI_PCM_BYTES_PER_SEC as u32);
         assert_eq!(one_sec, RCP_MASTER_HZ_NTSC);
+    }
+
+    #[test]
+    fn sp_dma_four_bytes_includes_overhead() {
+        assert!(sp_rsp_dma_total_cycles(3) >= 40);
     }
 }
