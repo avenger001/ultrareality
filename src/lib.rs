@@ -72,4 +72,6 @@ pub use present::{
     graphics_phase_reached, run_wgpu_loop, GraphicsPhase, PresentError, WgpuPresenter,
 };
 pub use video::{blit_rgba5551, blit_rgba5551_to_rgba8, pixel_rgba5551_to_argb};
-pub use rsp::{Rsp, RspState};
+pub use rsp::{
+    run_for_rcp_quantum, step_instruction, Rsp, RspState, RSP_CYCLES_PER_INSTR,
+};

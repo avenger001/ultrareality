@@ -149,6 +149,8 @@ pub struct SystemBus {
     pub rsp_pc: u32,
     /// `SP_IBIST` — stub storage for bring-up.
     pub rsp_ibist: u32,
+    /// RSP scalar GPR file (mirrors MIPS `r0`–`r31` for bring-up).
+    pub rsp_scalar_regs: [u32; 32],
     sp_dma_pending: Option<SpDmaPending>,
     dpc_rdp_pending: Option<DpcRdpPending>,
 }
@@ -175,6 +177,7 @@ impl SystemBus {
             sp_semaphore: 0,
             rsp_pc: 0,
             rsp_ibist: 0,
+            rsp_scalar_regs: [0u32; 32],
             sp_dma_pending: None,
             dpc_rdp_pending: None,
         }
@@ -201,6 +204,7 @@ impl SystemBus {
             sp_semaphore: 0,
             rsp_pc: 0,
             rsp_ibist: 0,
+            rsp_scalar_regs: [0u32; 32],
             sp_dma_pending: None,
             dpc_rdp_pending: None,
         }
@@ -228,6 +232,7 @@ impl SystemBus {
         self.ai.advance_time(delta, &mut self.mi);
         self.advance_sp_dma(delta);
         self.advance_dpc_rdp(delta);
+        crate::rsp::run_for_rcp_quantum(self, delta);
     }
 
     fn advance_sp_dma(&mut self, mut delta: u64) {
