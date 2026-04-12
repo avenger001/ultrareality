@@ -1,15 +1,17 @@
 //! Physical memory, PI/cartridge, RSP DMEM/IMEM, and RCP MMIO (SP/DPC, MI/VI/AI/SI/PIF).
 
 use crate::ai::{Ai, AI_REGS_BASE, AI_REGS_LEN};
-use crate::mi::{Mi, MI_INTR_SP, MI_REGS_BASE, MI_REGS_LEN};
+use crate::mi::{Mi, MI_INTR_DP, MI_INTR_SP, MI_REGS_BASE, MI_REGS_LEN};
 use crate::pif::{Pif, PIF_ROM_START, PIF_WINDOW_END};
-use crate::pi::{Pi, CART_DOM1_ADDR2_BASE, PI_REGS_BASE};
+use crate::pi::{Pi, CART_DOM1_ADDR2_BASE, PI_REGS_BASE, PI_REGS_LEN};
+use crate::ri::{Ri, RI_REGS_BASE, RI_REGS_LEN};
 use crate::rcp::{
     sp_dma_decode, sp_dma_end_addresses, DpcRegs, SpRegs, DPC_REGS_BASE, DPC_REGS_LEN,
     SP_PC_REG_IBIST, SP_PC_REG_PC, SP_PC_REGS_BASE, SP_PC_REGS_LEN, SP_REG_DMA_BUSY,
-    SP_REG_DMA_FULL, SP_REG_RD_LEN, SP_REG_SEMAPHORE, SP_REG_STATUS, SP_REG_WR_LEN,
-    SP_REGS_BASE, SP_REGS_LEN, SP_WORD_DRAM_ADDR, SP_WORD_MEM_ADDR,
+    SP_REG_DMA_FULL, SP_REG_RD_LEN, SP_REG_SEMAPHORE,
+    SP_REG_STATUS, SP_REG_WR_LEN, SP_REGS_BASE, SP_REGS_LEN, SP_WORD_DRAM_ADDR, SP_WORD_MEM_ADDR,
 };
+use crate::rdp::Rdp;
 use crate::si::{Si, SI_REGS_BASE, SI_REGS_LEN};
 use crate::vi::{Vi, VI_REGS_BASE, VI_REGS_LEN};
 
@@ -106,7 +108,7 @@ pub fn virt_to_phys_rdram(vaddr: u64, rdram_size: usize) -> Option<u32> {
     }
 }
 
-/// Full physical map: RDRAM, RSP, RCP MMIO, PI, cartridge ROM, PIF.
+/// Full physical map: RDRAM, RSP, RCP MMIO, RI, PI, cartridge ROM, PIF.
 pub struct SystemBus {
     pub rdram: PhysicalMemory,
     pub rsp_dmem: Box<[u8; RSP_DMEM_END as usize - RSP_DMEM_START as usize]>,
@@ -117,8 +119,12 @@ pub struct SystemBus {
     pub si: Si,
     pub pif: Pif,
     pub pi: Pi,
+    pub ri: Ri,
     pub sp_regs: SpRegs,
     pub dpc_regs: DpcRegs,
+    pub rdp: Rdp,
+    /// RDP list processing cycles billed to the master clock via [`SystemBus::drain_deferred_cycles`].
+    pub rdp_deferred_cycles: u64,
     /// RSP halted (bit 0 of `SP_STATUS`); cold reset keeps the RSP stopped until software clears halt.
     pub sp_halted: bool,
     pub sp_broke: bool,
@@ -142,8 +148,11 @@ impl SystemBus {
             si: Si::new(),
             pif: Pif::new(),
             pi: Pi::new(),
+            ri: Ri::new(),
             sp_regs: SpRegs::new(),
             dpc_regs: DpcRegs::new(),
+            rdp: Rdp::new(),
+            rdp_deferred_cycles: 0,
             sp_halted: true,
             sp_broke: false,
             sp_semaphore: 0,
@@ -163,8 +172,11 @@ impl SystemBus {
             si: Si::new(),
             pif: Pif::new(),
             pi: Pi::new(),
+            ri: Ri::new(),
             sp_regs: SpRegs::new(),
             dpc_regs: DpcRegs::new(),
+            rdp: Rdp::new(),
+            rdp_deferred_cycles: 0,
             sp_halted: true,
             sp_broke: false,
             sp_semaphore: 0,
@@ -173,13 +185,23 @@ impl SystemBus {
         }
     }
 
+    /// Charge VI readout of the current `VI_ORIGIN` / `VI_WIDTH` framebuffer (RGBA16 halfwords → RDRAM cycles).
+    pub fn schedule_vi_frame_fetch(&mut self) {
+        let px = self.vi.display_width() as u64 * self.vi.display_height() as u64;
+        self.vi.charge_framebuffer_fetch_rgba16_pixels(px);
+    }
+
     pub fn drain_pi_cycles(&mut self) -> u64 {
         self.pi.drain_cycles()
     }
 
-    /// PI DMA + SI DMA cycle debt (until RCP runs on the master timeline).
+    /// PI / SI / AI DMA, RDP list processing, and VI framebuffer read cycle debt folded into the next retired instruction.
     pub fn drain_deferred_cycles(&mut self) -> u64 {
-        self.drain_pi_cycles().saturating_add(self.si.drain_cycles())
+        self.drain_pi_cycles()
+            .saturating_add(self.si.drain_cycles())
+            .saturating_add(self.ai.drain_cycles())
+            .saturating_add(self.vi.drain_fetch_debt())
+            .saturating_add(std::mem::take(&mut self.rdp_deferred_cycles))
     }
 
     /// NTSC VI line: accumulate cycles and raise `MI_INTR_VI` each frame (stub).
@@ -426,8 +448,11 @@ impl Bus for SystemBus {
         if (AI_REGS_BASE..AI_REGS_BASE + AI_REGS_LEN as u32).contains(&paddr) {
             return Some(self.ai.read(paddr));
         }
-        if (PI_REGS_BASE..PI_REGS_BASE + 0x20).contains(&paddr) {
+        if (PI_REGS_BASE..PI_REGS_BASE + PI_REGS_LEN as u32).contains(&paddr) {
             return Some(self.pi.read_reg(paddr));
+        }
+        if (RI_REGS_BASE..RI_REGS_BASE + RI_REGS_LEN as u32).contains(&paddr) {
+            return Some(self.ri.read(paddr));
         }
         if (SI_REGS_BASE..SI_REGS_BASE + SI_REGS_LEN as u32).contains(&paddr) {
             return Some(self.si.read(paddr));
@@ -470,11 +495,26 @@ impl Bus for SystemBus {
             return;
         }
         if (DPC_REGS_BASE..DPC_REGS_BASE + DPC_REGS_LEN as u32).contains(&paddr) {
-            self.dpc_regs.write(paddr, value, &mut self.mi);
+            if let Some(k) = self.dpc_regs.write(paddr, value) {
+                let c = self.rdp.process_display_list(
+                    &mut self.rdram.data,
+                    &self.rsp_dmem[..],
+                    &self.rsp_imem[..],
+                    k.start,
+                    k.end,
+                    self.dpc_regs.status,
+                );
+                self.rdp_deferred_cycles = self.rdp_deferred_cycles.saturating_add(c);
+                self.mi.raise(MI_INTR_DP);
+            }
             return;
         }
-        if (PI_REGS_BASE..PI_REGS_BASE + 0x20).contains(&paddr) {
+        if (PI_REGS_BASE..PI_REGS_BASE + PI_REGS_LEN as u32).contains(&paddr) {
             self.pi.write_reg(paddr, value, &mut self.rdram, &mut self.mi);
+            return;
+        }
+        if (RI_REGS_BASE..RI_REGS_BASE + RI_REGS_LEN as u32).contains(&paddr) {
+            self.ri.write(paddr, value);
             return;
         }
         if (SI_REGS_BASE..SI_REGS_BASE + SI_REGS_LEN as u32).contains(&paddr) {
@@ -547,28 +587,77 @@ impl Default for SystemBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::AI_REGS_BASE;
-    use crate::mi::{MI_INTR_AI, MI_INTR_SP, MI_VERSION_DEFAULT};
+    use crate::ai::{AI_REG_LEN, AI_REGS_BASE};
+    use crate::mi::{MI_INTR_AI, MI_INTR_SP, MI_REG_VERSION, MI_VERSION_DEFAULT};
     use crate::rcp::{
-        SP_PC_REG_IBIST, SP_PC_REGS_BASE, SP_REG_RD_LEN, SP_REG_SEMAPHORE, SP_REG_STATUS,
-        SP_REGS_BASE,
+        SP_PC_REG_IBIST, SP_PC_REGS_BASE, SP_REG_DRAM_ADDR, SP_REG_MEM_ADDR, SP_REG_RD_LEN,
+        SP_REG_SEMAPHORE, SP_REG_STATUS, SP_REGS_BASE,
     };
+    use crate::ri::{RI_MODE_DEFAULT, RI_REG_MODE, RI_REGS_BASE};
+    use crate::vi::{VI_OFF_ORIGIN, VI_REG_ORIGIN, VI_REGS_BASE};
 
     #[test]
     fn mi_version_register() {
         let mut bus = SystemBus::with_rdram_size(1024 * 1024);
         assert_eq!(
-            bus.read_u32(0x0430_0004),
+            bus.read_u32(MI_REGS_BASE + MI_REG_VERSION),
             Some(MI_VERSION_DEFAULT)
         );
+    }
+
+    #[test]
+    fn ri_mode_reset_visible_on_bus() {
+        let mut bus = SystemBus::with_rdram_size(1024 * 1024);
+        assert_eq!(bus.read_u32(RI_REGS_BASE + RI_REG_MODE), Some(RI_MODE_DEFAULT));
     }
 
     #[test]
     fn ai_len_write_sets_mi_ai() {
         let mut bus = SystemBus::with_rdram_size(1024 * 1024);
         bus.mi.mask = MI_INTR_AI;
-        bus.write_u32(AI_REGS_BASE + 0x04, 0x1000);
+        bus.write_u32(AI_REGS_BASE + AI_REG_LEN, 0x1000);
         assert!(bus.mi.cpu_irq_pending());
+    }
+
+    #[test]
+    fn vi_origin_round_trip_on_bus() {
+        let mut bus = SystemBus::with_rdram_size(1024 * 1024);
+        bus.write_u32(VI_REGS_BASE + VI_OFF_ORIGIN, 0x0012_3456);
+        assert_eq!(bus.read_u32(VI_REGS_BASE + VI_OFF_ORIGIN), Some(0x0012_3456));
+        assert_eq!(bus.vi.regs[VI_REG_ORIGIN], 0x0012_3456);
+    }
+
+    #[test]
+    fn dpc_end_runs_rdp_fill_rect_list() {
+        use crate::rcp::{DPC_REG_END, DPC_REG_START, DPC_REGS_BASE};
+
+        let mut bus = SystemBus::with_rdram_size(1024 * 1024);
+        let origin = 0x0008_0000u32;
+        bus.write_u32(VI_REGS_BASE + VI_OFF_ORIGIN, origin);
+
+        let base = 0x1000usize;
+        let w0_c = 0xFF080140u32;
+        let w1_c = origin;
+        let cmd1 = ((w0_c as u64) << 32) | (w1_c as u64);
+        let w0_f = 0xF700_FFFFu32;
+        let cmd2 = (w0_f as u64) << 32;
+        let w0_r = (0xF6u32 << 24) | (8 << 12) | 8;
+        let w1_r = (4 << 12) | 4;
+        let cmd3 = ((w0_r as u64) << 32) | (w1_r as u64);
+        for (i, cmd) in [cmd1, cmd2, cmd3].iter().enumerate() {
+            bus.rdram.data[base + i * 8..base + i * 8 + 8].copy_from_slice(&cmd.to_be_bytes());
+        }
+
+        bus.mi.intr = 0;
+        bus.write_u32(DPC_REGS_BASE + DPC_REG_START, base as u32);
+        bus.write_u32(DPC_REGS_BASE + DPC_REG_END, (base + 24) as u32);
+        assert_ne!(bus.mi.intr & crate::mi::MI_INTR_DP, 0);
+
+        let off = origin as usize + (1usize * 320 + 1) * 2;
+        assert_eq!(
+            u16::from_be_bytes([bus.rdram.data[off], bus.rdram.data[off + 1]]),
+            0xFFFF
+        );
     }
 
     #[test]
@@ -576,8 +665,8 @@ mod tests {
         let mut bus = SystemBus::with_rdram_size(1024 * 1024);
         bus.mi.intr = 0;
         bus.rdram.data[0x100..0x104].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
-        bus.write_u32(SP_REGS_BASE, 0x0400_0000);
-        bus.write_u32(SP_REGS_BASE + 0x04, 0x0000_0100);
+        bus.write_u32(SP_REGS_BASE + SP_REG_MEM_ADDR, 0x0400_0000);
+        bus.write_u32(SP_REGS_BASE + SP_REG_DRAM_ADDR, 0x0000_0100);
         bus.write_u32(SP_REGS_BASE + SP_REG_RD_LEN, 3);
         assert_eq!(&bus.rsp_dmem[0..4], &[0xAA, 0xBB, 0xCC, 0xDD]);
         assert_ne!(bus.mi.intr & MI_INTR_SP, 0);
@@ -588,8 +677,8 @@ mod tests {
         let mut bus = SystemBus::with_rdram_size(1024 * 1024);
         bus.mi.intr = 0;
         bus.rdram.data[0x100..0x104].fill(0x5A);
-        bus.write_u32(SP_REGS_BASE, 0x0400_0000);
-        bus.write_u32(SP_REGS_BASE + 0x04, 0x0000_0100);
+        bus.write_u32(SP_REGS_BASE + SP_REG_MEM_ADDR, 0x0400_0000);
+        bus.write_u32(SP_REGS_BASE + SP_REG_DRAM_ADDR, 0x0000_0100);
         bus.write_u32(SP_REGS_BASE + SP_REG_RD_LEN, 3);
         assert_eq!(bus.sp_regs.words[0], 0x0400_0004);
         assert_eq!(bus.sp_regs.words[1], 0x0000_0104);
@@ -634,8 +723,8 @@ mod tests {
         let mut bus = SystemBus::with_rdram_size(1024 * 1024);
         bus.mi.intr = 0;
         bus.rsp_dmem[0..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
-        bus.write_u32(SP_REGS_BASE, 0x0400_0000);
-        bus.write_u32(SP_REGS_BASE + 0x04, 0x0000_0200);
+        bus.write_u32(SP_REGS_BASE + SP_REG_MEM_ADDR, 0x0400_0000);
+        bus.write_u32(SP_REGS_BASE + SP_REG_DRAM_ADDR, 0x0000_0200);
         bus.write_u32(SP_REGS_BASE + SP_REG_WR_LEN, 3);
         assert_eq!(&bus.rdram.data[0x200..0x204], &[0x11, 0x22, 0x33, 0x44]);
         assert_ne!(bus.mi.intr & MI_INTR_SP, 0);
@@ -650,8 +739,8 @@ mod tests {
         bus.rdram.data[0x301] = 0x11;
         bus.rdram.data[0x30A] = 0xaa;
         bus.rdram.data[0x30B] = 0xbb;
-        bus.write_u32(SP_REGS_BASE, 0x0400_0000);
-        bus.write_u32(SP_REGS_BASE + 0x04, 0x0000_0300);
+        bus.write_u32(SP_REGS_BASE + SP_REG_MEM_ADDR, 0x0400_0000);
+        bus.write_u32(SP_REGS_BASE + SP_REG_DRAM_ADDR, 0x0000_0300);
         bus.write_u32(SP_REGS_BASE + SP_REG_RD_LEN, 0x0080_1001);
         assert_eq!(&bus.rsp_dmem[0..4], &[0x10, 0x11, 0xaa, 0xbb]);
         assert_ne!(bus.mi.intr & MI_INTR_SP, 0);

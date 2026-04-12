@@ -2,21 +2,38 @@
 
 use crate::bus::{Bus, PhysicalMemory};
 use crate::mi::{Mi, MI_INTR_PI};
+use crate::timing::{pi_cart_dma_total_cycles, PI_ROM_DMA_CYCLES_PER_BYTE};
 
 /// PI register block base (physical).
 pub const PI_REGS_BASE: u32 = 0x0460_0000;
+pub const PI_REGS_LEN: usize = 0x20;
 
 /// Cartridge ROM mapping base (physical).
 pub const CART_DOM1_ADDR2_BASE: u32 = 0x1000_0000;
 
-/// Rough cycle cost for PI DMA (bytes × factor); refined when the RCP bus is modeled.
-pub const PI_CYCLES_PER_DMA_BYTE: u64 = 1;
+/// ROM byte offset used in PI DMA tests as a source dword (not a hardware constant; arbitrary pattern location).
+pub const CART_ROM_TEST_DWORD_OFF: usize = 0x40;
+
+/// `PI_DRAM_ADDR` / `PI_CART_ADDR` / length registers ([n64brew: PI](https://n64brew.dev/wiki/Peripheral_Interface)).
+pub const PI_REG_DRAM_ADDR: u32 = 0x00;
+pub const PI_REG_CART_ADDR: u32 = 0x04;
+/// Cart → RDRAM DMA “read”; write starts transfer; read returns last written length − 1 (low 24 bits).
+pub const PI_REG_RD_LEN: u32 = 0x0C;
+/// RDRAM → cart DMA “write”; write starts transfer. **Read** at `0x10` is [`Pi::status`] (`PI_STATUS`).
+pub const PI_REG_WR_LEN: u32 = 0x10;
+
+/// RCP cycles per byte for PI cart ROM DMA ([`PI_ROM_DMA_CYCLES_PER_BYTE`](crate::timing::PI_ROM_DMA_CYCLES_PER_BYTE)).
+pub const PI_CYCLES_PER_DMA_BYTE: u64 = PI_ROM_DMA_CYCLES_PER_BYTE;
 
 #[derive(Debug)]
 pub struct Pi {
     pub rom: Vec<u8>,
     pub dram_addr: u32,
     pub cart_addr: u32,
+    /// Last value written to `PI_RD_LEN` (length − 1 field); returned on read.
+    pub rd_len: u32,
+    /// Last value written to `PI_WR_LEN` (length − 1); for debugging / extension.
+    pub wr_len: u32,
     /// Minimal status: bit0 = DMA busy (stub), bit1 = interrupt (stub).
     pub status: u32,
     pending_cycles: u64,
@@ -28,6 +45,8 @@ impl Pi {
             rom: Vec::new(),
             dram_addr: 0,
             cart_addr: 0,
+            rd_len: 0,
+            wr_len: 0,
             status: 0,
             pending_cycles: 0,
         }
@@ -38,6 +57,8 @@ impl Pi {
             rom,
             dram_addr: 0,
             cart_addr: 0,
+            rd_len: 0,
+            wr_len: 0,
             status: 0,
             pending_cycles: 0,
         }
@@ -50,7 +71,7 @@ impl Pi {
     }
 
     fn reg_offset(paddr: u32) -> Option<u32> {
-        if (PI_REGS_BASE..PI_REGS_BASE + 0x20).contains(&paddr) {
+        if (PI_REGS_BASE..PI_REGS_BASE + PI_REGS_LEN as u32).contains(&paddr) {
             Some(paddr - PI_REGS_BASE)
         } else {
             None
@@ -62,10 +83,10 @@ impl Pi {
             return 0;
         };
         match off {
-            0x00 => self.dram_addr,
-            0x04 => self.cart_addr,
-            0x0C => 0,
-            0x10 => self.status,
+            PI_REG_DRAM_ADDR => self.dram_addr,
+            PI_REG_CART_ADDR => self.cart_addr,
+            PI_REG_RD_LEN => self.rd_len & 0x00FF_FFFF,
+            PI_REG_WR_LEN => self.status,
             _ => 0,
         }
     }
@@ -75,11 +96,15 @@ impl Pi {
             return;
         };
         match off {
-            0x00 => self.dram_addr = value,
-            0x04 => self.cart_addr = value,
-            0x0C => self.dma_read(rdram, value, mi),
-            0x10 => {
-                self.dma_write(rdram, value, mi);
+            PI_REG_DRAM_ADDR => self.dram_addr = value,
+            PI_REG_CART_ADDR => self.cart_addr = value,
+            PI_REG_RD_LEN => {
+                self.rd_len = value & 0x00FF_FFFF;
+                self.dma_read(rdram, self.rd_len, mi);
+            }
+            PI_REG_WR_LEN => {
+                self.wr_len = value & 0x00FF_FFFF;
+                self.dma_write(rdram, self.wr_len, mi);
             }
             _ => {}
         }
@@ -122,7 +147,9 @@ impl Pi {
             dram = dram.wrapping_add(1) & rdram_mask;
         }
 
-        self.pending_cycles = self.pending_cycles.saturating_add(len.saturating_mul(PI_CYCLES_PER_DMA_BYTE));
+        self.pending_cycles = self
+            .pending_cycles
+            .saturating_add(pi_cart_dma_total_cycles(len));
         self.status = (self.status & !1) | 2;
         mi.raise(MI_INTR_PI);
     }
@@ -130,7 +157,9 @@ impl Pi {
     /// PI “write” DMA: RDRAM → cart (save chips). No writable retail ROM; consume cycles only.
     fn dma_write(&mut self, rdram: &mut PhysicalMemory, len_minus_one: u32, mi: &mut Mi) {
         let len = (len_minus_one as u64).saturating_add(1);
-        self.pending_cycles = self.pending_cycles.saturating_add(len.saturating_mul(PI_CYCLES_PER_DMA_BYTE));
+        self.pending_cycles = self
+            .pending_cycles
+            .saturating_add(pi_cart_dma_total_cycles(len));
         let _ = rdram;
         self.status |= 2;
         mi.raise(MI_INTR_PI);
@@ -171,17 +200,31 @@ mod tests {
     #[test]
     fn pi_dma_copy_header_to_rdram() {
         let mut rom = vec![0u8; 0x1000];
-        rom[0x40..0x44].copy_from_slice(&0x8037_0012u32.to_be_bytes());
+        rom[CART_ROM_TEST_DWORD_OFF..CART_ROM_TEST_DWORD_OFF + 4]
+            .copy_from_slice(&0x8037_0012u32.to_be_bytes());
 
         let mut pi = Pi::with_rom(rom);
         let mut rdram = PhysicalMemory::new(4 * 1024 * 1024);
         let mut mi = Mi::new();
-        pi.cart_addr = CART_DOM1_ADDR2_BASE + 0x40;
+        pi.cart_addr = CART_DOM1_ADDR2_BASE + CART_ROM_TEST_DWORD_OFF as u32;
         pi.dram_addr = 0x0000_0000;
 
-        pi.write_reg(PI_REGS_BASE + 0x0C, 3, &mut rdram, &mut mi);
+        pi.write_reg(PI_REGS_BASE + PI_REG_RD_LEN, 3, &mut rdram, &mut mi);
 
         assert_eq!(rdram.read_u32(0).unwrap(), 0x8037_0012);
         assert_ne!(mi.intr & MI_INTR_PI, 0);
+        assert_eq!(pi.read_reg(PI_REGS_BASE + PI_REG_RD_LEN), 3);
+    }
+
+    #[test]
+    fn pi_rd_len_readback_after_dma() {
+        let rom = vec![0xAAu8; 0x10];
+        let mut pi = Pi::with_rom(rom);
+        let mut rdram = PhysicalMemory::new(4 * 1024 * 1024);
+        let mut mi = Mi::new();
+        pi.cart_addr = CART_DOM1_ADDR2_BASE;
+        pi.dram_addr = 0;
+        pi.write_reg(PI_REGS_BASE + PI_REG_RD_LEN, 0, &mut rdram, &mut mi);
+        assert_eq!(pi.read_reg(PI_REGS_BASE + PI_REG_RD_LEN), 0);
     }
 }

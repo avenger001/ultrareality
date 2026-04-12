@@ -1,25 +1,41 @@
-//! Audio Interface (AI): RDRAM → DAC FIFO (no real sample timing yet).
+//! Audio Interface (AI): RDRAM → DAC FIFO.
 //!
-//! A **non-zero** write to `AI_LEN` (`0x0450_0004`) is treated as an audio DMA completing immediately
-//! and raises [`crate::mi::MI_INTR_AI`], matching the usual “one IRQ per buffer” expectation.
+//! A **non-zero** write to `AI_LEN` ([`AI_REG_LEN`]) raises [`crate::mi::MI_INTR_AI`] and records
+//! **RCP cycle debt** for buffer playback ([`crate::timing::ai_pcm_buffer_cycles`]) so [`crate::Machine`]
+//! advances [`crate::cpu::cop0::Cop0::count`] and the master timeline with PI/SI/VI.
 
 use crate::mi::{Mi, MI_INTR_AI};
+use crate::timing::ai_pcm_buffer_cycles;
 
 pub const AI_REGS_BASE: u32 = 0x0450_0000;
 pub const AI_REGS_LEN: usize = 0x20;
-/// Word index of `AI_LEN` (`0x04` from [`AI_REGS_BASE`]).
-pub const AI_REG_LEN: usize = 1;
+
+/// Byte offset of `AI_DRAM_ADDR` (PCM buffer in RDRAM).
+pub const AI_REG_DRAM_ADDR: u32 = 0x00;
+/// Byte offset of `AI_LEN` — non-zero write completes the audio DMA stub and raises `MI_INTR_AI`.
+pub const AI_REG_LEN: u32 = 0x04;
+
+/// Word index of `AI_LEN` in [`Ai::regs`] (same as `AI_REG_LEN / 4`).
+const AI_WORD_INDEX_LEN: usize = 1;
 
 #[derive(Debug)]
 pub struct Ai {
     pub regs: [u32; AI_REGS_LEN / 4],
+    pending_cycles: u64,
 }
 
 impl Ai {
     pub fn new() -> Self {
         Self {
             regs: [0u32; AI_REGS_LEN / 4],
+            pending_cycles: 0,
         }
+    }
+
+    pub fn drain_cycles(&mut self) -> u64 {
+        let c = self.pending_cycles;
+        self.pending_cycles = 0;
+        c
     }
 
     pub fn offset(paddr: u32) -> Option<usize> {
@@ -51,7 +67,10 @@ impl Ai {
         if let Some(r) = self.regs.get_mut(wi) {
             *r = value;
         }
-        if wi == AI_REG_LEN && value != 0 {
+        if wi == AI_WORD_INDEX_LEN && value != 0 {
+            self.pending_cycles = self
+                .pending_cycles
+                .saturating_add(ai_pcm_buffer_cycles(value));
             mi.raise(MI_INTR_AI);
         }
     }
@@ -73,8 +92,9 @@ mod tests {
         let mut ai = Ai::new();
         let mut mi = Mi::new();
         mi.mask = MI_INTR_AI;
-        ai.write(AI_REGS_BASE + 0x04, 0x800, &mut mi);
+        ai.write(AI_REGS_BASE + AI_REG_LEN, 0x800, &mut mi);
         assert!(mi.cpu_irq_pending());
+        assert_eq!(ai.drain_cycles(), crate::timing::ai_pcm_buffer_cycles(0x800));
     }
 
     #[test]
@@ -82,7 +102,7 @@ mod tests {
         let mut ai = Ai::new();
         let mut mi = Mi::new();
         mi.mask = MI_INTR_AI;
-        ai.write(AI_REGS_BASE + 0x04, 0, &mut mi);
+        ai.write(AI_REGS_BASE + AI_REG_LEN, 0, &mut mi);
         assert!(!mi.cpu_irq_pending());
     }
 }

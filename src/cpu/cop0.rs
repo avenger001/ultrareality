@@ -41,6 +41,16 @@ pub const CAUSE_IP7: u32 = 1 << 15;
 /// Cause: branch delay — last exception was from a delay slot (`EPC` points at branch).
 pub const CAUSE_BD: u32 = 1 << 31;
 
+/// Cached **kseg0** PC for general external interrupt / exception when `Status.BEV` is clear (`0x8000_0180` sign-extended).
+pub const KSEG0_INTERRUPT_VECTOR_PC: u64 = 0xFFFF_FFFF_8000_0180;
+/// **kseg1** bootstrap vector when `Status.BEV` is set (`0xBFC0_0380` sign-extended).
+pub const KSEG1_BEV_INTERRUPT_VECTOR_PC: u64 = 0xFFFF_FFFF_BFC0_0380;
+/// Byte offset from segment base for those vectors; physical address in low RDRAM is **`0x180`**.
+pub const GENERAL_EXCEPTION_OFFSET: u32 = 0x180;
+
+/// `break` instruction word (special `0` / funct `0x0D`) — minimal handler placeholder in tests.
+pub const MIPS_OPCODE_BREAK: u32 = 0x0000_000D;
+
 #[derive(Clone, Debug)]
 pub struct Cop0 {
     pub status: u32,
@@ -214,9 +224,9 @@ impl Cop0 {
     #[inline]
     pub fn interrupt_vector(&self) -> u64 {
         if (self.status & STATUS_BEV) != 0 {
-            0xFFFF_FFFF_BFC0_0380u64
+            KSEG1_BEV_INTERRUPT_VECTOR_PC
         } else {
-            0xFFFF_FFFF_8000_0180u64
+            KSEG0_INTERRUPT_VECTOR_PC
         }
     }
 
@@ -447,5 +457,14 @@ mod tests {
         let mut c = Cop0::new();
         c.write_xpr64(14, 0xFFFF_FFFF_8000_4000);
         assert_eq!(c.read_xpr64(14), 0xFFFF_FFFF_8000_4000);
+    }
+
+    #[test]
+    fn interrupt_vector_matches_pc_constants() {
+        let mut c = Cop0::new();
+        c.status &= !STATUS_BEV;
+        assert_eq!(c.interrupt_vector(), KSEG0_INTERRUPT_VECTOR_PC);
+        c.status |= STATUS_BEV;
+        assert_eq!(c.interrupt_vector(), KSEG1_BEV_INTERRUPT_VECTOR_PC);
     }
 }

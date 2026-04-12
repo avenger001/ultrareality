@@ -1,7 +1,7 @@
 //! ROM header parsing and IPL3 bootstrap using **PI DMA** (same mechanism as hardware after PIF hands off).
 //!
 //! For cold boot from real PIF firmware, use [`crate::Machine::bootstrap_from_pif_reset`] after loading a
-//! PIF dump. The cart fast path ([`ipl3_load_via_pi_dma`]) takes the entry PC from the ROM header (`0x08`)
+//! PIF dump. The cart fast path ([`ipl3_load_via_pi_dma`]) takes the entry PC from the ROM header ([`ROM_OFF_BOOT_ADDRESS`])
 //! and copies the IPL3-sized region via [`crate::pi::Pi`] DMA, raising [`crate::mi::MI_INTR_PI`] on
 //! completion like hardware.
 
@@ -27,15 +27,18 @@ pub fn rom_u32_be(rom: &[u8], offset: usize) -> Option<u32> {
 /// Typical game entry after IPL; used when the header word is zero.
 pub const DEFAULT_GAME_ENTRY_PC: u64 = 0xFFFF_FFFF_8000_0400;
 
+/// Byte offset of the **Boot Address** word in a big-endian ROM image ([n64brew ROM_Header](https://n64brew.dev/wiki/ROM_Header)).
+pub const ROM_OFF_BOOT_ADDRESS: usize = 0x08;
+
 /// ROM offset where IPL3 starts copying (after the 4 KiB header + IPL3 slot).
 pub const IPL3_ROM_DMA_START: usize = 0x1000;
 /// IPL3 copies **1 MiB** from [`IPL3_ROM_DMA_START`] into RDRAM at the boot address.
 pub const IPL3_COPY_LEN: usize = 0x0010_0000;
 
-/// Boot PC from ROM header word at **0x08** (Boot Address), per [n64brew ROM_Header](https://n64brew.dev/wiki/ROM_Header).
+/// Boot PC from ROM header word at [`ROM_OFF_BOOT_ADDRESS`] (Boot Address), per [n64brew ROM_Header](https://n64brew.dev/wiki/ROM_Header).
 /// Word at **0x0C** is libultra version metadata, not the entry PC.
 pub fn cart_boot_pc(rom: &[u8]) -> Option<u64> {
-    let w = rom_u32_be(rom, 0x08)?;
+    let w = rom_u32_be(rom, ROM_OFF_BOOT_ADDRESS)?;
     if w == 0 {
         return Some(DEFAULT_GAME_ENTRY_PC);
     }
@@ -73,7 +76,8 @@ mod tests {
     #[test]
     fn cart_boot_reads_header_word() {
         let mut rom = vec![0u8; 0x1000];
-        rom[0x08..0x0C].copy_from_slice(&0x8000_1234u32.to_be_bytes());
+        rom[ROM_OFF_BOOT_ADDRESS..ROM_OFF_BOOT_ADDRESS + 4]
+            .copy_from_slice(&0x8000_1234u32.to_be_bytes());
         assert_eq!(cart_boot_pc(&rom), Some(sign_extend_word32(0x8000_1234)));
     }
 
@@ -83,7 +87,8 @@ mod tests {
         use crate::pi::Pi;
 
         let mut rom = vec![0u8; 0x2000];
-        rom[0x08..0x0C].copy_from_slice(&0x8000_0400u32.to_be_bytes());
+        rom[ROM_OFF_BOOT_ADDRESS..ROM_OFF_BOOT_ADDRESS + 4]
+            .copy_from_slice(&0x8000_0400u32.to_be_bytes());
         rom[0x1000..0x1004].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
 
         let mut rdram = PhysicalMemory::new(4 * 1024 * 1024);

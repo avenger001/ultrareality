@@ -3,18 +3,30 @@
 use crate::bus::{Bus, PhysicalMemory};
 use crate::mi::{Mi, MI_INTR_SI};
 use crate::pif::{Pif, PIF_RAM_LEN, PIF_RAM_START};
+use crate::timing::SI_DMA_64_BLOCK_CYCLES;
 
 pub const SI_REGS_BASE: u32 = 0x0480_0000;
 pub const SI_REGS_LEN: usize = 0x20;
 
-/// Cycles charged per 64-byte SI DMA (stub until bus timing is modeled).
-pub const SI_DMA_CYCLES: u64 = 640;
+/// `SI_DRAM_ADDR` — RDRAM physical for the 64-byte SI DMA ([n64brew: SI](https://n64brew.dev/wiki/Serial_Interface)).
+pub const SI_REG_DRAM_ADDR: u32 = 0x00;
+/// PIF address for **PIF RAM → RDRAM** DMA (`RD64B`).
+pub const SI_REG_PIF_ADDR_RD64B: u32 = 0x04;
+/// PIF address for **RDRAM → PIF RAM** DMA (`WR64B`).
+pub const SI_REG_PIF_ADDR_WR64B: u32 = 0x10;
+/// `SI_STATUS` — busy / complete bits.
+pub const SI_REG_STATUS: u32 = 0x18;
+
+/// RCP cycles charged per 64-byte SI DMA ([`SI_DMA_64_BLOCK_CYCLES`](crate::timing::SI_DMA_64_BLOCK_CYCLES)).
+pub const SI_DMA_CYCLES: u64 = SI_DMA_64_BLOCK_CYCLES;
 
 #[derive(Debug)]
 pub struct Si {
     pub dram_addr: u32,
-    /// Full PIF-side address used for DMA (often `0x1FC007C0` for RAM).
-    pub pif_addr: u32,
+    /// Last PIF address written for a **read** DMA (`SI_REG_PIF_ADDR_RD64B`).
+    pub pif_addr_rd: u32,
+    /// Last PIF address written for a **write** DMA (`SI_REG_PIF_ADDR_WR64B`).
+    pub pif_addr_wr: u32,
     /// Bits 0–1: busy during DMA; bit 2: completion (until next DMA starts).
     pub status: u32,
     pending_cycles: u64,
@@ -24,7 +36,8 @@ impl Si {
     pub fn new() -> Self {
         Self {
             dram_addr: 0,
-            pif_addr: 0,
+            pif_addr_rd: 0,
+            pif_addr_wr: 0,
             status: 0,
             pending_cycles: 0,
         }
@@ -49,15 +62,15 @@ impl Si {
             return 0;
         };
         match off {
-            0x00 => self.dram_addr,
-            0x04 => self.pif_addr,
-            0x10 => self.pif_addr,
-            0x18 => self.status,
+            SI_REG_DRAM_ADDR => self.dram_addr,
+            SI_REG_PIF_ADDR_RD64B => self.pif_addr_rd,
+            SI_REG_PIF_ADDR_WR64B => self.pif_addr_wr,
+            SI_REG_STATUS => self.status,
             _ => 0,
         }
     }
 
-    /// Writes to `SI_PIF_ADDR_RD64B` / `SI_PIF_ADDR_WR64B` load `pif_addr` and start DMA.
+    /// Writes to [`SI_REG_PIF_ADDR_RD64B`] / [`SI_REG_PIF_ADDR_WR64B`] start DMA and update the matching latch.
     pub fn write(
         &mut self,
         paddr: u32,
@@ -70,13 +83,13 @@ impl Si {
             return;
         };
         match off {
-            0x00 => self.dram_addr = value,
-            0x04 => {
-                self.pif_addr = value;
+            SI_REG_DRAM_ADDR => self.dram_addr = value,
+            SI_REG_PIF_ADDR_RD64B => {
+                self.pif_addr_rd = value;
                 self.dma_rd64(rdram, pif, mi);
             }
-            0x10 => {
-                self.pif_addr = value;
+            SI_REG_PIF_ADDR_WR64B => {
+                self.pif_addr_wr = value;
                 self.dma_wr64(rdram, pif, mi);
             }
             _ => {}
@@ -86,7 +99,7 @@ impl Si {
     /// DMA: PIF RAM → RDRAM (64 bytes).
     fn dma_rd64(&mut self, rdram: &mut PhysicalMemory, pif: &Pif, mi: &mut Mi) {
         self.status = (self.status & !4) | 3;
-        let base = pif_ram_byte_index(self.pif_addr);
+        let base = pif_ram_byte_index(self.pif_addr_rd);
         let dram = (self.dram_addr & 0x00FF_FFFF) as usize;
         let rdram_len = rdram.data.len();
         for i in 0..PIF_RAM_LEN {
@@ -104,7 +117,7 @@ impl Si {
     /// DMA: RDRAM → PIF RAM (64 bytes).
     fn dma_wr64(&mut self, rdram: &mut PhysicalMemory, pif: &mut Pif, mi: &mut Mi) {
         self.status = (self.status & !4) | 3;
-        let base = pif_ram_byte_index(self.pif_addr);
+        let base = pif_ram_byte_index(self.pif_addr_wr);
         let dram = (self.dram_addr & 0x00FF_FFFF) as usize;
         let rdram_len = rdram.data.len();
         for i in 0..PIF_RAM_LEN {
@@ -148,14 +161,28 @@ mod tests {
         pif.ram[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
 
         // PIF RAM → RDRAM (SI read DMA)
-        si.write(SI_REGS_BASE, 0x0010_0000, &mut rdram, &mut pif, &mut mi);
-        si.write(SI_REGS_BASE + 0x04, PIF_RAM_START, &mut rdram, &mut pif, &mut mi);
+        si.write(SI_REGS_BASE + SI_REG_DRAM_ADDR, 0x0010_0000, &mut rdram, &mut pif, &mut mi);
+        si.write(
+            SI_REGS_BASE + SI_REG_PIF_ADDR_RD64B,
+            PIF_RAM_START,
+            &mut rdram,
+            &mut pif,
+            &mut mi,
+        );
+        assert_eq!(si.read(SI_REGS_BASE + SI_REG_PIF_ADDR_RD64B), PIF_RAM_START);
         assert_ne!(mi.intr & MI_INTR_SI, 0);
         mi.clear(MI_INTR_SI);
 
         pif.ram[0..4].fill(0);
         // RDRAM → PIF RAM (SI write DMA)
-        si.write(SI_REGS_BASE + 0x10, PIF_RAM_START, &mut rdram, &mut pif, &mut mi);
+        si.write(
+            SI_REGS_BASE + SI_REG_PIF_ADDR_WR64B,
+            PIF_RAM_START,
+            &mut rdram,
+            &mut pif,
+            &mut mi,
+        );
+        assert_eq!(si.read(SI_REGS_BASE + SI_REG_PIF_ADDR_WR64B), PIF_RAM_START);
 
         assert_eq!(&pif.ram[0..4], &0xDEAD_BEEFu32.to_be_bytes());
         assert_ne!(mi.intr & MI_INTR_SI, 0);

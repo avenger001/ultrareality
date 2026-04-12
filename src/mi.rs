@@ -1,10 +1,19 @@
 //! MIPS Interface (MI): RCP interrupt routing and mode.
 //!
-//! **Acknowledge:** a write to `MI_INTR` (`0x0430_0008`) clears bits that are set in the value
+//! **Acknowledge:** a write to [`MI_REG_INTR`] clears bits that are set in the value
 //! (write-1-to-clear / W1C), matching common N64 behavior.
 
 pub const MI_REGS_BASE: u32 = 0x0430_0000;
 pub const MI_REGS_LEN: usize = 0x10;
+
+/// `MI_MODE` — RCP mode ([n64brew: MI](https://n64brew.dev/wiki/MIPS_Interface)).
+pub const MI_REG_MODE: u32 = 0x00;
+/// `MI_VERSION` — read-only; returns [`MI_VERSION_DEFAULT`].
+pub const MI_REG_VERSION: u32 = 0x04;
+/// `MI_INTR` — pending RCP interrupt bits; **write** with bits set clears them (W1C).
+pub const MI_REG_INTR: u32 = 0x08;
+/// `MI_INTR_MASK` — which [`MI_INTR_*`] lines can assert the CPU interrupt.
+pub const MI_REG_INTR_MASK: u32 = 0x0C;
 
 /// Hardware version / revision (read-only), typical retail value.
 pub const MI_VERSION_DEFAULT: u32 = 0x0202_0102;
@@ -64,10 +73,10 @@ impl Mi {
             return 0;
         };
         match off {
-            0x00 => self.mode,
-            0x04 => MI_VERSION_DEFAULT,
-            0x08 => self.intr,
-            0x0C => self.mask,
+            MI_REG_MODE => self.mode,
+            MI_REG_VERSION => MI_VERSION_DEFAULT,
+            MI_REG_INTR => self.intr,
+            MI_REG_INTR_MASK => self.mask,
             _ => 0,
         }
     }
@@ -77,9 +86,9 @@ impl Mi {
             return;
         };
         match off {
-            0x00 => self.mode = value,
-            0x08 => self.intr &= !value,
-            0x0C => self.mask = value,
+            MI_REG_MODE => self.mode = value,
+            MI_REG_INTR => self.intr &= !value,
+            MI_REG_INTR_MASK => self.mask = value,
             _ => {}
         }
     }
@@ -99,12 +108,20 @@ mod tests {
     fn write_intr_ack_clears_selected_bits() {
         let mut mi = Mi::new();
         mi.raise(MI_INTR_PI | MI_INTR_SI | MI_INTR_VI);
-        mi.write(MI_REGS_BASE + 0x08, MI_INTR_PI);
+        mi.write(MI_REGS_BASE + MI_REG_INTR, MI_INTR_PI);
         assert_eq!(mi.intr & MI_INTR_PI, 0);
         assert_ne!(mi.intr & MI_INTR_SI, 0);
         assert_ne!(mi.intr & MI_INTR_VI, 0);
-        mi.write(MI_REGS_BASE + 0x08, MI_INTR_SI | MI_INTR_VI);
+        mi.write(MI_REGS_BASE + MI_REG_INTR, MI_INTR_SI | MI_INTR_VI);
         assert_eq!(mi.intr, 0);
+    }
+
+    #[test]
+    fn mode_register_round_trip() {
+        let mut mi = Mi::new();
+        assert_eq!(mi.read(MI_REGS_BASE + MI_REG_MODE), 0);
+        mi.write(MI_REGS_BASE + MI_REG_MODE, 0x1234_5678);
+        assert_eq!(mi.read(MI_REGS_BASE + MI_REG_MODE), 0x1234_5678);
     }
 
     #[test]

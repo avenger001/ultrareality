@@ -1,5 +1,6 @@
-//! Top-level machine: master cycle counter and devices that will eventually
-//! run on the same 93.75 MHz (NTSC) timeline as the RCP.
+//! Top-level machine: [`crate::timing::RCP_MASTER_HZ_NTSC`] master cycle counter.
+//! PI / SI / AI / VI defer RCP cycle debt into [`crate::bus::SystemBus::drain_deferred_cycles`]
+//! each CPU step so `Count`, `master_cycles`, and VI frame timing stay aligned.
 
 use crate::boot::{ipl3_load_via_pi_dma, DEFAULT_GAME_SP};
 use crate::bus::SystemBus;
@@ -97,8 +98,15 @@ impl Default for Machine {
 mod tests {
     use super::*;
     use crate::bus::Bus;
-    use crate::cpu::cop0::{EXCCODE_INT, STATUS_EXL, STATUS_IE};
-    use crate::ai::AI_REGS_BASE;
+    use crate::cpu::cop0::{
+        CAUSE_BD, CAUSE_EXCCODE_MASK, CAUSE_EXCCODE_SHIFT, EXCCODE_INT, GENERAL_EXCEPTION_OFFSET,
+        KSEG0_INTERRUPT_VECTOR_PC, MIPS_OPCODE_BREAK, STATUS_EXL, STATUS_IE,
+    };
+    use crate::ai::{AI_REG_LEN, AI_REGS_BASE};
+
+    /// Test RDRAM destinations for PI/SI DMA integration tests (physical).
+    const RDRAM_TEST_PI_DST: u32 = 0x100;
+    const RDRAM_TEST_SI_DST: u32 = 0x200;
     use crate::mi::{
         MI_INTR_AI, MI_INTR_DP, MI_INTR_PI, MI_INTR_SI, MI_INTR_SP, MI_INTR_VI,
     };
@@ -106,11 +114,11 @@ mod tests {
 
     #[test]
     fn mi_interrupt_delivers_to_handler_vector() {
-        use crate::cpu::cop0::CAUSE_BD;
-
         let mut m = Machine::new();
-        // Handler at 0x80000180 → physical 0x180: `break` (syscall) as placeholder
-        m.bus.rdram.write_u32(0x180, 0x0000_000D);
+        // Placeholder handler at KSEG0 general vector (physical GENERAL_EXCEPTION_OFFSET): `break`.
+        m.bus
+            .rdram
+            .write_u32(GENERAL_EXCEPTION_OFFSET, MIPS_OPCODE_BREAK);
 
         m.cpu.reset(0x8000_2000);
         // Fresh `reset` COP0 still has ERL/BEV bits that block external interrupts.
@@ -122,7 +130,7 @@ mod tests {
 
         m.step().unwrap();
 
-        assert_eq!(m.cpu.pc, 0xFFFF_FFFF_8000_0180u64);
+        assert_eq!(m.cpu.pc, KSEG0_INTERRUPT_VECTOR_PC);
         assert_eq!(m.cpu.cop0.epc, 0x8000_2000);
         assert!((m.cpu.cop0.status & STATUS_EXL) != 0);
         assert!((m.cpu.cop0.cause & CAUSE_BD) == 0);
@@ -140,30 +148,40 @@ mod tests {
 
     #[test]
     fn pi_dma_sets_mi_and_interrupt_delivers() {
-        use crate::cpu::cop0::CAUSE_EXCCODE_MASK;
-        use crate::cpu::cop0::CAUSE_EXCCODE_SHIFT;
-        use crate::pi::{CART_DOM1_ADDR2_BASE, PI_REGS_BASE};
+        use crate::pi::{
+            CART_DOM1_ADDR2_BASE, CART_ROM_TEST_DWORD_OFF, PI_REG_CART_ADDR, PI_REG_DRAM_ADDR,
+            PI_REG_RD_LEN, PI_REGS_BASE,
+        };
 
         let mut m = Machine::new();
         let mut rom = vec![0u8; 0x200];
-        rom[0x40..0x44].copy_from_slice(&0x1122_3344u32.to_be_bytes());
+        rom[CART_ROM_TEST_DWORD_OFF..CART_ROM_TEST_DWORD_OFF + 4]
+            .copy_from_slice(&0x1122_3344u32.to_be_bytes());
         m.set_cartridge_rom(rom);
 
-        m.bus.rdram.write_u32(0x180, 0x0000_000D);
+        m.bus
+            .rdram
+            .write_u32(GENERAL_EXCEPTION_OFFSET, MIPS_OPCODE_BREAK);
         m.cpu.reset(0x8000_4000);
         m.cpu.cop0.status = STATUS_IE;
         m.bus.mi.mask = MI_INTR_PI;
         m.bus.mi.intr = 0;
 
-        m.bus.write_u32(PI_REGS_BASE + 0x00, 0x100);
-        m.bus.write_u32(PI_REGS_BASE + 0x04, CART_DOM1_ADDR2_BASE + 0x40);
-        m.bus.write_u32(PI_REGS_BASE + 0x0C, 3);
+        m.bus.write_u32(PI_REGS_BASE + PI_REG_DRAM_ADDR, RDRAM_TEST_PI_DST);
+        m.bus.write_u32(
+            PI_REGS_BASE + PI_REG_CART_ADDR,
+            CART_DOM1_ADDR2_BASE + CART_ROM_TEST_DWORD_OFF as u32,
+        );
+        m.bus.write_u32(PI_REGS_BASE + PI_REG_RD_LEN, 3);
 
         assert_ne!(m.bus.mi.intr & MI_INTR_PI, 0);
-        assert_eq!(m.bus.rdram.read_u32(0x100).unwrap(), 0x1122_3344);
+        assert_eq!(
+            m.bus.rdram.read_u32(RDRAM_TEST_PI_DST).unwrap(),
+            0x1122_3344
+        );
 
         m.step().unwrap();
-        assert_eq!(m.cpu.pc, 0xFFFF_FFFF_8000_0180u64);
+        assert_eq!(m.cpu.pc, KSEG0_INTERRUPT_VECTOR_PC);
         assert_eq!(m.cpu.cop0.epc, 0x8000_4000);
         let exc = (m.cpu.cop0.cause >> CAUSE_EXCCODE_SHIFT) & CAUSE_EXCCODE_MASK;
         assert_eq!(exc, EXCCODE_INT);
@@ -171,29 +189,32 @@ mod tests {
 
     #[test]
     fn si_dma_sets_mi_and_interrupt_delivers() {
-        use crate::cpu::cop0::CAUSE_EXCCODE_MASK;
-        use crate::cpu::cop0::CAUSE_EXCCODE_SHIFT;
         use crate::pif::{PIF_RAM_START, PIF_ROM_LEN};
-        use crate::si::SI_REGS_BASE;
+        use crate::si::{SI_REG_DRAM_ADDR, SI_REG_PIF_ADDR_RD64B, SI_REGS_BASE};
 
         let mut m = Machine::new();
         m.set_pif_rom(&vec![0x3Cu8; PIF_ROM_LEN]).unwrap();
         m.bus.pif.ram[0..4].copy_from_slice(&0x99AA_BBCCu32.to_be_bytes());
 
-        m.bus.rdram.write_u32(0x180, 0x0000_000D);
+        m.bus
+            .rdram
+            .write_u32(GENERAL_EXCEPTION_OFFSET, MIPS_OPCODE_BREAK);
         m.cpu.reset(0x8000_5000);
         m.cpu.cop0.status = STATUS_IE;
         m.bus.mi.mask = MI_INTR_SI;
         m.bus.mi.intr = 0;
 
-        m.bus.write_u32(SI_REGS_BASE, 0x200);
-        m.bus.write_u32(SI_REGS_BASE + 0x04, PIF_RAM_START);
+        m.bus.write_u32(SI_REGS_BASE + SI_REG_DRAM_ADDR, RDRAM_TEST_SI_DST);
+        m.bus.write_u32(SI_REGS_BASE + SI_REG_PIF_ADDR_RD64B, PIF_RAM_START);
 
         assert_ne!(m.bus.mi.intr & MI_INTR_SI, 0);
-        assert_eq!(m.bus.rdram.read_u32(0x200).unwrap(), 0x99AA_BBCC);
+        assert_eq!(
+            m.bus.rdram.read_u32(RDRAM_TEST_SI_DST).unwrap(),
+            0x99AA_BBCC
+        );
 
         m.step().unwrap();
-        assert_eq!(m.cpu.pc, 0xFFFF_FFFF_8000_0180u64);
+        assert_eq!(m.cpu.pc, KSEG0_INTERRUPT_VECTOR_PC);
         assert_eq!(m.cpu.cop0.epc, 0x8000_5000);
         let exc = (m.cpu.cop0.cause >> CAUSE_EXCCODE_SHIFT) & CAUSE_EXCCODE_MASK;
         assert_eq!(exc, EXCCODE_INT);
@@ -201,21 +222,20 @@ mod tests {
 
     #[test]
     fn ai_len_write_sets_mi_and_interrupt_delivers() {
-        use crate::cpu::cop0::CAUSE_EXCCODE_MASK;
-        use crate::cpu::cop0::CAUSE_EXCCODE_SHIFT;
-
         let mut m = Machine::new();
-        m.bus.rdram.write_u32(0x180, 0x0000_000D);
+        m.bus
+            .rdram
+            .write_u32(GENERAL_EXCEPTION_OFFSET, MIPS_OPCODE_BREAK);
         m.cpu.reset(0x8000_6000);
         m.cpu.cop0.status = STATUS_IE;
         m.bus.mi.mask = MI_INTR_AI;
         m.bus.mi.intr = 0;
 
-        m.bus.write_u32(AI_REGS_BASE + 0x04, 0x400);
+        m.bus.write_u32(AI_REGS_BASE + AI_REG_LEN, 0x400);
 
         assert_ne!(m.bus.mi.intr & MI_INTR_AI, 0);
         m.step().unwrap();
-        assert_eq!(m.cpu.pc, 0xFFFF_FFFF_8000_0180u64);
+        assert_eq!(m.cpu.pc, KSEG0_INTERRUPT_VECTOR_PC);
         assert_eq!(m.cpu.cop0.epc, 0x8000_6000);
         let exc = (m.cpu.cop0.cause >> CAUSE_EXCCODE_SHIFT) & CAUSE_EXCCODE_MASK;
         assert_eq!(exc, EXCCODE_INT);
@@ -223,11 +243,10 @@ mod tests {
 
     #[test]
     fn sp_rd_len_sets_mi_and_interrupt_delivers() {
-        use crate::cpu::cop0::CAUSE_EXCCODE_MASK;
-        use crate::cpu::cop0::CAUSE_EXCCODE_SHIFT;
-
         let mut m = Machine::new();
-        m.bus.rdram.write_u32(0x180, 0x0000_000D);
+        m.bus
+            .rdram
+            .write_u32(GENERAL_EXCEPTION_OFFSET, MIPS_OPCODE_BREAK);
         m.cpu.reset(0x8000_7000);
         m.cpu.cop0.status = STATUS_IE;
         m.bus.mi.mask = MI_INTR_SP;
@@ -237,7 +256,7 @@ mod tests {
 
         assert_ne!(m.bus.mi.intr & MI_INTR_SP, 0);
         m.step().unwrap();
-        assert_eq!(m.cpu.pc, 0xFFFF_FFFF_8000_0180u64);
+        assert_eq!(m.cpu.pc, KSEG0_INTERRUPT_VECTOR_PC);
         assert_eq!(m.cpu.cop0.epc, 0x8000_7000);
         let exc = (m.cpu.cop0.cause >> CAUSE_EXCCODE_SHIFT) & CAUSE_EXCCODE_MASK;
         assert_eq!(exc, EXCCODE_INT);
@@ -245,11 +264,10 @@ mod tests {
 
     #[test]
     fn dpc_end_sets_mi_and_interrupt_delivers() {
-        use crate::cpu::cop0::CAUSE_EXCCODE_MASK;
-        use crate::cpu::cop0::CAUSE_EXCCODE_SHIFT;
-
         let mut m = Machine::new();
-        m.bus.rdram.write_u32(0x180, 0x0000_000D);
+        m.bus
+            .rdram
+            .write_u32(GENERAL_EXCEPTION_OFFSET, MIPS_OPCODE_BREAK);
         m.cpu.reset(0x8000_8000);
         m.cpu.cop0.status = STATUS_IE;
         m.bus.mi.mask = MI_INTR_DP;
@@ -259,7 +277,7 @@ mod tests {
 
         assert_ne!(m.bus.mi.intr & MI_INTR_DP, 0);
         m.step().unwrap();
-        assert_eq!(m.cpu.pc, 0xFFFF_FFFF_8000_0180u64);
+        assert_eq!(m.cpu.pc, KSEG0_INTERRUPT_VECTOR_PC);
         assert_eq!(m.cpu.cop0.epc, 0x8000_8000);
         let exc = (m.cpu.cop0.cause >> CAUSE_EXCCODE_SHIFT) & CAUSE_EXCCODE_MASK;
         assert_eq!(exc, EXCCODE_INT);

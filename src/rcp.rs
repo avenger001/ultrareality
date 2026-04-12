@@ -6,15 +6,17 @@
 //! are handled in [`crate::bus::SystemBus`] (halt, `MI_INTR_SP` clear/set, lock). The RSP PC lives
 //! at [`SP_PC_REGS_BASE`] (not `SP_REGS_BASE`).
 //!
-//! **DPC**: command DMA addresses and [`crate::mi::MI_INTR_DP`] on **non-zero** `DPC_END` (no RDP
-//! command processing yet — completion is **instant** and `DPC_CURRENT` reflects the end address).
-
-use crate::mi::{Mi, MI_INTR_DP};
+//! **DPC**: command DMA addresses; [`crate::mi::MI_INTR_DP`] is raised by [`crate::bus::SystemBus`]
+//! after [`crate::rdp::Rdp::process_display_list`] runs (non-zero `DPC_END`).
 
 /// RSP SP register block ([n64brew: RSP](https://n64brew.dev/wiki/RSP)).
 pub const SP_REGS_BASE: u32 = 0x0404_0000;
 pub const SP_REGS_LEN: usize = 0x20;
 
+/// `SP_MEM_ADDR` — RSP DMEM/IMEM address for DMA.
+pub const SP_REG_MEM_ADDR: u32 = 0x00;
+/// `SP_DRAM_ADDR` — RDRAM address for DMA.
+pub const SP_REG_DRAM_ADDR: u32 = 0x04;
 /// `SP_RD_LEN` — DMA RDRAM → DMEM.
 pub const SP_REG_RD_LEN: u32 = 0x08;
 /// `SP_WR_LEN` — DMA DMEM → RDRAM.
@@ -130,9 +132,9 @@ pub const DPC_REGS_LEN: usize = 0x20;
 
 /// RDRAM/DMEM command range start (8-byte aligned address bits).
 pub const DPC_REG_START: u32 = 0x00;
-/// Exclusive end of RDP command DMA (`DPC_END` write kicks processing + `MI_INTR_DP` when non-zero).
+/// Exclusive end of RDP command DMA (`DPC_END` write kicks RDP when non-zero).
 pub const DPC_REG_END: u32 = 0x04;
-/// DMA position (after a completed `DPC_END`, equals masked end in this stub).
+/// DMA position (after a completed `DPC_END`, equals masked end).
 pub const DPC_REG_CURRENT: u32 = 0x08;
 /// `DPC_STATUS` — busy / pending flags ([n64brew DPC_STATUS](https://n64brew.dev/wiki/Reality_Display_Processor/Interface)).
 pub const DPC_REG_STATUS: u32 = 0x0C;
@@ -161,8 +163,15 @@ pub struct DpcRegs {
     pub start: u32,
     pub end: u32,
     pub current: u32,
-    /// Raw `DPC_STATUS` read value; no GPU — stays idle after each instant `DPC_END` completion.
+    /// Raw `DPC_STATUS` read value.
     pub status: u32,
+}
+
+/// Returned when a non-zero `DPC_END` write completes the command FIFO (bus runs RDP + raises DP intr).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DpcEndKick {
+    pub start: u32,
+    pub end: u32,
 }
 
 impl DpcRegs {
@@ -197,14 +206,16 @@ impl DpcRegs {
         }
     }
 
-    pub fn write(&mut self, paddr: u32, value: u32, mi: &mut Mi) {
+    /// Writes a DPC register. On non-zero `DPC_END`, returns [`DpcEndKick`] so the bus can run the RDP.
+    pub fn write(&mut self, paddr: u32, value: u32) -> Option<DpcEndKick> {
         let Some(off) = Self::reg_offset(paddr) else {
-            return;
+            return None;
         };
         match off {
             DPC_REG_START => {
                 self.start = dpc_addr_mask(value);
                 self.status |= DPC_STATUS_START_PENDING;
+                None
             }
             DPC_REG_END => {
                 self.end = dpc_addr_mask(value);
@@ -216,14 +227,20 @@ impl DpcRegs {
                         | DPC_STATUS_CMD_BUSY
                         | DPC_STATUS_PIPE_BUSY
                         | DPC_STATUS_TMEM_BUSY);
-                    mi.raise(MI_INTR_DP);
+                    Some(DpcEndKick {
+                        start: self.start,
+                        end: self.end,
+                    })
+                } else {
+                    None
                 }
             }
-            DPC_REG_CURRENT => {}
+            DPC_REG_CURRENT => None,
             DPC_REG_STATUS => {
                 self.status_write(value);
+                None
             }
-            _ => {}
+            _ => None,
         }
     }
 
@@ -247,7 +264,6 @@ impl Default for DpcRegs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mi::Mi;
 
     #[test]
     fn sp_dma_decode_single_line_matches_len_minus_one() {
@@ -271,20 +287,21 @@ mod tests {
     }
 
     #[test]
-    fn dpc_end_raises_dp() {
+    fn dpc_end_returns_kick() {
         let mut dpc = DpcRegs::new();
-        let mut mi = Mi::new();
-        mi.mask = MI_INTR_DP;
-        dpc.write(DPC_REGS_BASE + DPC_REG_END, 0x80123456, &mut mi);
-        assert!(mi.cpu_irq_pending());
+        dpc.write(DPC_REGS_BASE + DPC_REG_START, 0x8012_3000);
+        let k = dpc
+            .write(DPC_REGS_BASE + DPC_REG_END, 0x8012_3458)
+            .expect("kick");
+        assert_eq!(k.start, 0x8012_3000 & 0x00FF_FFF8);
+        assert_eq!(k.end, 0x8012_3458 & 0x00FF_FFF8);
     }
 
     #[test]
     fn dpc_end_sets_current_instant_complete() {
         let mut dpc = DpcRegs::new();
-        let mut mi = Mi::new();
-        dpc.write(DPC_REGS_BASE + DPC_REG_START, 0x8012_3000, &mut mi);
-        dpc.write(DPC_REGS_BASE + DPC_REG_END, 0x8012_3458, &mut mi);
+        dpc.write(DPC_REGS_BASE + DPC_REG_START, 0x8012_3000);
+        dpc.write(DPC_REGS_BASE + DPC_REG_END, 0x8012_3458);
         assert_eq!(dpc.read(DPC_REGS_BASE + DPC_REG_CURRENT), 0x8012_3458 & 0x00FF_FFF8);
         assert_eq!(
             dpc.read(DPC_REGS_BASE + DPC_REG_STATUS) & DPC_STATUS_DMA_BUSY,
@@ -295,10 +312,9 @@ mod tests {
     #[test]
     fn dpc_status_xbus_dma_toggle() {
         let mut dpc = DpcRegs::new();
-        let mut mi = Mi::new();
-        dpc.write(DPC_REGS_BASE + DPC_REG_STATUS, 2, &mut mi);
+        dpc.write(DPC_REGS_BASE + DPC_REG_STATUS, 2);
         assert_ne!(dpc.read(DPC_REGS_BASE + DPC_REG_STATUS) & DPC_STATUS_XBUS_DMEM, 0);
-        dpc.write(DPC_REGS_BASE + DPC_REG_STATUS, 1, &mut mi);
+        dpc.write(DPC_REGS_BASE + DPC_REG_STATUS, 1);
         assert_eq!(dpc.read(DPC_REGS_BASE + DPC_REG_STATUS) & DPC_STATUS_XBUS_DMEM, 0);
     }
 }

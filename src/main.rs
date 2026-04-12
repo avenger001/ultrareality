@@ -122,6 +122,7 @@ fn run_demo() {
         let fw = m.bus.vi.display_width();
         let fh = m.bus.vi.display_height();
         blit_rgba5551(&m.bus.rdram.data, o, fw, fh, &mut buffer, OUT_W, OUT_H);
+        m.bus.schedule_vi_frame_fetch();
         window
             .update_with_buffer(&buffer, OUT_W, OUT_H)
             .expect("update");
@@ -204,6 +205,7 @@ fn run_rom(path: &Path, pif_path: Option<&Path>, fast_boot: bool) {
         let fw = m.bus.vi.display_width();
         let fh = m.bus.vi.display_height();
         blit_rgba5551(&m.bus.rdram.data, o, fw, fh, &mut buffer, OUT_W, OUT_H);
+        m.bus.schedule_vi_frame_fetch();
 
         window
             .update_with_buffer(&buffer, OUT_W, OUT_H)

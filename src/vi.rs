@@ -22,10 +22,35 @@ pub const VI_REG_V_BURST: usize = 11;
 pub const VI_REG_X_SCALE: usize = 12;
 pub const VI_REG_Y_SCALE: usize = 13;
 
-/// NTSC ~59.94 Hz vertical interrupt at 93.75 MHz CPU clock: `93_750_000 / 59.94`.
-pub const VI_NTSC_CYCLES_PER_FRAME: u64 = 1_564_062;
+/// Byte offset of the word-sized VI register at `word_index` (`0` … `13`).
+#[inline]
+pub const fn vi_reg_byte_off(word_index: usize) -> u32 {
+    (word_index as u32) * 4
+}
+
+/// Byte offset from [`VI_REGS_BASE`] for each VI word (same as [`vi_reg_byte_off`] of the matching [`VI_REG_*`] index).
+pub const VI_OFF_CONTROL: u32 = vi_reg_byte_off(VI_REG_CONTROL);
+pub const VI_OFF_ORIGIN: u32 = vi_reg_byte_off(VI_REG_ORIGIN);
+pub const VI_OFF_WIDTH: u32 = vi_reg_byte_off(VI_REG_WIDTH);
+pub const VI_OFF_V_INTR: u32 = vi_reg_byte_off(VI_REG_V_INTR);
+pub const VI_OFF_V_CURRENT: u32 = vi_reg_byte_off(VI_REG_V_CURRENT);
+pub const VI_OFF_BURST: u32 = vi_reg_byte_off(VI_REG_BURST);
+pub const VI_OFF_V_SYNC: u32 = vi_reg_byte_off(VI_REG_V_SYNC);
+pub const VI_OFF_H_SYNC: u32 = vi_reg_byte_off(VI_REG_H_SYNC);
+pub const VI_OFF_LEAP: u32 = vi_reg_byte_off(VI_REG_LEAP);
+pub const VI_OFF_H_VIDEO: u32 = vi_reg_byte_off(VI_REG_H_VIDEO);
+pub const VI_OFF_V_VIDEO: u32 = vi_reg_byte_off(VI_REG_V_VIDEO);
+pub const VI_OFF_V_BURST: u32 = vi_reg_byte_off(VI_REG_V_BURST);
+pub const VI_OFF_X_SCALE: u32 = vi_reg_byte_off(VI_REG_X_SCALE);
+pub const VI_OFF_Y_SCALE: u32 = vi_reg_byte_off(VI_REG_Y_SCALE);
+
+/// NTSC ~59.94 Hz vertical interrupt; RCP cycles per field ([`crate::timing::RCP_MASTER_HZ_NTSC`]).
+pub const VI_NTSC_CYCLES_PER_FRAME: u64 = crate::timing::VI_NTSC_CYCLES_PER_FRAME;
 /// Stub: treat a frame as 262 active scanlines for `VI_V_CURRENT` scaling.
 pub const VI_NTSC_SCANLINES: u64 = 262;
+
+/// RDRAM cycles charged per byte for VI framebuffer readout (no serial Rambus model; scales with [`Vi::charge_framebuffer_fetch_rgba16_pixels`]).
+pub const VI_RDRAM_CYCLES_PER_BYTE: u64 = 2;
 
 #[derive(Debug)]
 pub struct Vi {
@@ -34,6 +59,8 @@ pub struct Vi {
     pub cycle_in_frame: u64,
     /// Increments each time a full NTSC frame elapses (stub timing).
     pub frame_counter: u64,
+    /// Master-cycle debt for reading the framebuffer from RDRAM (billed via [`crate::bus::SystemBus::drain_deferred_cycles`]).
+    pub fetch_debt: u64,
 }
 
 impl Vi {
@@ -42,7 +69,20 @@ impl Vi {
             regs: [0u32; 14],
             cycle_in_frame: 0,
             frame_counter: 0,
+            fetch_debt: 0,
         }
+    }
+
+    /// Schedule RDRAM bandwidth cost for reading `pixels` RGBA5551 texels (2 bytes each) for display.
+    pub fn charge_framebuffer_fetch_rgba16_pixels(&mut self, pixels: u64) {
+        let bytes = pixels.saturating_mul(2);
+        self.fetch_debt = self
+            .fetch_debt
+            .saturating_add(bytes.saturating_mul(VI_RDRAM_CYCLES_PER_BYTE));
+    }
+
+    pub fn drain_fetch_debt(&mut self) -> u64 {
+        std::mem::take(&mut self.fetch_debt)
     }
 
     /// Add retired cycles; when a frame elapses, raise `MI_INTR_VI` (stub timing).
@@ -146,22 +186,28 @@ mod tests {
     fn v_current_tracks_cycle_in_frame() {
         let mut vi = Vi::new();
         let mut mi = Mi::new();
-        assert_eq!(vi.read(VI_REGS_BASE + (VI_REG_V_CURRENT as u32 * 4)), 0);
+        assert_eq!(vi.read(VI_REGS_BASE + VI_OFF_V_CURRENT), 0);
         vi.advance(VI_NTSC_CYCLES_PER_FRAME / 2, &mut mi);
-        let mid = vi.read(VI_REGS_BASE + (VI_REG_V_CURRENT as u32 * 4));
+        let mid = vi.read(VI_REGS_BASE + VI_OFF_V_CURRENT);
         assert!(
             mid >= 120 && mid <= 140,
             "mid-frame V_CURRENT should be ~half of 262 lines, got {mid}"
         );
         vi.advance(VI_NTSC_CYCLES_PER_FRAME / 2, &mut mi);
         assert_eq!(vi.cycle_in_frame, 0);
-        assert_eq!(vi.read(VI_REGS_BASE + (VI_REG_V_CURRENT as u32 * 4)), 0);
+        assert_eq!(vi.read(VI_REGS_BASE + VI_OFF_V_CURRENT), 0);
     }
 
     #[test]
     fn v_current_register_is_read_only() {
         let mut vi = Vi::new();
-        vi.write(VI_REGS_BASE + (VI_REG_V_CURRENT as u32 * 4), 0xFFFF_FFFF);
-        assert_ne!(vi.read(VI_REGS_BASE + (VI_REG_V_CURRENT as u32 * 4)), 0xFFFF_FFFF);
+        vi.write(VI_REGS_BASE + VI_OFF_V_CURRENT, 0xFFFF_FFFF);
+        assert_ne!(vi.read(VI_REGS_BASE + VI_OFF_V_CURRENT), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn vi_off_aliases_match_vi_reg_byte_off() {
+        assert_eq!(VI_OFF_ORIGIN, vi_reg_byte_off(VI_REG_ORIGIN));
+        assert_eq!(VI_OFF_V_CURRENT, 0x10);
     }
 }
