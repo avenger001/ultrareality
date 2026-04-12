@@ -224,7 +224,8 @@ impl SystemBus {
             .saturating_add(std::mem::take(&mut self.rdp_deferred_cycles))
     }
 
-    /// Advance in-flight PI / SI / AI / SP / DPC work by `delta` RCP cycles (same quantum as the current CPU step).
+    /// Advance in-flight PI / SI / AI / SP / DPC work by `delta` **RCP master cycles**.
+    /// Each subsystem’s timers see the **same** `delta` in parallel (real hardware overlap), not sequential draining.
     pub fn rcp_advance_dma_in_flight(&mut self, delta: u64) {
         self.pi.advance_time(delta, &mut self.rdram, &mut self.mi);
         self.si
@@ -283,7 +284,7 @@ impl SystemBus {
         }
     }
 
-    /// NTSC VI line: accumulate cycles and raise `MI_INTR_VI` each frame (stub).
+    /// VI field timer: same `delta` as [`Self::rcp_advance_dma_in_flight`] for lockstep with DMA/audio.
     pub fn advance_vi_frame_timing(&mut self, cycles: u64) {
         self.vi.advance(cycles, &mut self.mi);
     }

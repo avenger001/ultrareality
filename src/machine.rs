@@ -1,19 +1,20 @@
-//! Top-level machine: [`crate::timing::RCP_MASTER_HZ_NTSC`] master cycle counter.
-//! Each step adds CPU cycles plus VI/RDP deferred debt ([`crate::bus::SystemBus::drain_deferred_cycles`]),
-//! then advances in-flight PI/SI/AI DMA on the same quantum ([`crate::bus::SystemBus::rcp_advance_dma_in_flight`])
-//! so `Count`, `master_cycles`, and VI frame timing stay aligned.
+//! Top-level machine: one [`crate::timing::RCP_MASTER_HZ_NTSC`] timeline for CPU retirements and RCP I/O.
+//! Each step adds interpreter cycles plus VI/RDP deferred debt ([`crate::bus::SystemBus::drain_deferred_cycles`]),
+//! then applies that `delta` to PI/SI/AI/SP/DPC in parallel and to the VI field counter — see [`crate::timing`] module docs.
 
 use crate::boot::{ipl3_load_via_pi_dma, DEFAULT_GAME_SP};
 use crate::bus::SystemBus;
 use crate::cpu::{CpuHalt, R4300i};
 use crate::pif::{PifRomLoadError, PIF_KSEG1_RESET_PC};
+use crate::timing::MasterCycles;
 
 pub struct Machine {
     pub cpu: R4300i,
     pub bus: SystemBus,
-    pub master_cycles: u64,
+    /// Monotonic RCP master-cycle sum ([`crate::timing::RCP_MASTER_HZ_NTSC`]).
+    pub master_cycles: MasterCycles,
     /// Retired cycles from the previous `cpu.step` (incl. bus debt), fed into `Count` before the next instruction.
-    last_retired_cycles: u64,
+    last_retired_cycles: MasterCycles,
 }
 
 impl Machine {
@@ -51,6 +52,13 @@ impl Machine {
         };
         self.cpu.reset(pc);
         self.cpu.regs[29] = DEFAULT_GAME_SP;
+    }
+
+    /// RCP cycles accounted for the last finished [`step`](Self::step) or [`run`](Self::run) iteration
+    /// (CPU retirements + [`SystemBus::drain_deferred_cycles`] debt). Zero before the first step.
+    #[inline]
+    pub fn last_step_rcp_cycles(&self) -> MasterCycles {
+        self.last_retired_cycles
     }
 
     pub fn step(&mut self) -> Result<(), CpuHalt> {
@@ -117,6 +125,20 @@ mod tests {
     };
     use crate::rcp::{DPC_REG_END, DPC_REGS_BASE, SP_REG_RD_LEN, SP_REGS_BASE};
     use crate::rdp::Rdp;
+
+    #[test]
+    fn last_step_rcp_cycles_matches_master_delta() {
+        let mut m = Machine::new();
+        assert_eq!(m.last_step_rcp_cycles(), 0);
+        m.bus
+            .rdram
+            .write_u32(0, MIPS_OPCODE_BREAK);
+        m.cpu.reset(0x8000_0000);
+        m.step().unwrap();
+        let last = m.last_step_rcp_cycles();
+        assert!(last > 0);
+        assert_eq!(m.master_cycles, last);
+    }
 
     #[test]
     fn mi_interrupt_delivers_to_handler_vector() {

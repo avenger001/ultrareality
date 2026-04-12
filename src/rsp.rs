@@ -9,6 +9,22 @@ use crate::mi::MI_INTR_SP;
 /// RCP cycles charged per scalar instruction (stub until cycle-accurate RSP exists).
 pub const RSP_CYCLES_PER_INSTR: u64 = 2;
 
+#[inline]
+fn gpr_load(regs: &[u32; 32], r: usize) -> u32 {
+    if r == 0 {
+        0
+    } else {
+        regs[r]
+    }
+}
+
+#[inline]
+fn gpr_store(regs: &mut [u32; 32], r: usize, v: u32) {
+    if r != 0 {
+        regs[r] = v;
+    }
+}
+
 /// Placeholder for a future instance-based API (state is on [`SystemBus`]).
 #[derive(Clone, Debug, Default)]
 pub struct RspState {
@@ -81,13 +97,13 @@ pub fn step_instruction(bus: &mut SystemBus) -> u64 {
             0x00 => {
                 // SLL — if not all-zero, shift; `0x00000000` is NOP.
                 if iw != 0 {
-                    bus.rsp_scalar_regs[rd] =
-                        bus.rsp_scalar_regs[rt].wrapping_shl(sa);
+                    let v = gpr_load(&bus.rsp_scalar_regs, rt).wrapping_shl(sa);
+                    gpr_store(&mut bus.rsp_scalar_regs, rd, v);
                 }
             }
             0x08 => {
                 // JR
-                next = bus.rsp_scalar_regs[rs] & 0xFFC;
+                next = gpr_load(&bus.rsp_scalar_regs, rs) & 0xFFC;
             }
             0x0D => {
                 // BREAK
@@ -105,32 +121,35 @@ pub fn step_instruction(bus: &mut SystemBus) -> u64 {
         5 => {
             // BNE — branch if rs != rt
             let off = ((iw & 0xFFFF) as i16 as i32 as i32) << 2;
-            if bus.rsp_scalar_regs[rs] != bus.rsp_scalar_regs[rt] {
+            if gpr_load(&bus.rsp_scalar_regs, rs) != gpr_load(&bus.rsp_scalar_regs, rt) {
                 next = (pc as i32 + 4 + off) as u32;
                 next &= 0xFFC;
             }
         }
         9 => {
             // ADDIU
-            bus.rsp_scalar_regs[rt] = bus.rsp_scalar_regs[rs].wrapping_add(simm);
+            let v = gpr_load(&bus.rsp_scalar_regs, rs).wrapping_add(simm);
+            gpr_store(&mut bus.rsp_scalar_regs, rt, v);
         }
         13 => {
             // ORI
-            bus.rsp_scalar_regs[rt] = bus.rsp_scalar_regs[rs] | immu;
+            let v = gpr_load(&bus.rsp_scalar_regs, rs) | immu;
+            gpr_store(&mut bus.rsp_scalar_regs, rt, v);
         }
         15 => {
             // LUI
-            bus.rsp_scalar_regs[rt] = immu << 16;
+            gpr_store(&mut bus.rsp_scalar_regs, rt, immu << 16);
         }
         35 => {
             // LW
-            let base = bus.rsp_scalar_regs[rs].wrapping_add(simm);
-            bus.rsp_scalar_regs[rt] = rsp_load_flat(bus, base);
+            let base = gpr_load(&bus.rsp_scalar_regs, rs).wrapping_add(simm);
+            let v = rsp_load_flat(bus, base);
+            gpr_store(&mut bus.rsp_scalar_regs, rt, v);
         }
         43 => {
             // SW
-            let base = bus.rsp_scalar_regs[rs].wrapping_add(simm);
-            rsp_store_flat(bus, base, bus.rsp_scalar_regs[rt]);
+            let base = gpr_load(&bus.rsp_scalar_regs, rs).wrapping_add(simm);
+            rsp_store_flat(bus, base, gpr_load(&bus.rsp_scalar_regs, rt));
         }
         18 => {
             // COP2 — vector unit; not emulated: consume cycles and advance PC.
@@ -219,5 +238,16 @@ mod tests {
         step_instruction(&mut bus);
         step_instruction(&mut bus);
         assert_eq!(bus.rsp_scalar_regs[2], 0x40);
+    }
+
+    #[test]
+    fn addiu_to_r0_discards_result() {
+        let mut bus = SystemBus::with_rdram_size(1024 * 1024);
+        bus.sp_halted = false;
+        bus.rsp_pc = 0;
+        // ADDIU r0, r0, 0x123
+        write_imem(&mut bus, 0, 0x2400_0123);
+        step_instruction(&mut bus);
+        assert_eq!(bus.rsp_scalar_regs[0], 0);
     }
 }

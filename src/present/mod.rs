@@ -25,5 +25,5 @@ pub enum GraphicsPhase {
 
 /// Reported progress toward on-screen output (extend as features land).
 pub fn graphics_phase_reached() -> GraphicsPhase {
-    GraphicsPhase::RspTask
+    GraphicsPhase::SoftwareRdp
 }

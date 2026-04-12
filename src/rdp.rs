@@ -2,11 +2,12 @@
 //!
 //! Full hardware includes triangle rasterization, TMEM, texture filter, and the color combiner
 //! pipeline. This module implements **command decode**, **RDRAM-backed SetColorImage + FillRectangle**
-//! (RGBA16), **texture image / tile / load** scaffolding for TMEM, **combiner register** storage,
-//! and **cycle estimates** for list DMA and framebuffer writes. Triangles are recognized but not
-//! rasterized yet.
+//! (RGBA16), **TextureRectangle** (nearest-neighbor from TMEM), **texture image / tile / load**
+//! scaffolding for TMEM, **combiner register** storage, and **cycle estimates** for list DMA and
+//! framebuffer writes. Triangles are recognized but not rasterized yet.
 
 use crate::rcp::DPC_STATUS_XBUS_DMEM;
+use crate::timing::RDRAM_BUS_CYCLES_PER_BYTE;
 
 /// 4 KiB TMEM ([n64brew](https://n64brew.dev/wiki/Reality_Display_Processor/Texture_Memory)).
 pub const TMEM_SIZE: usize = 4096;
@@ -41,8 +42,8 @@ pub const TRIANGLE_CMD_STUB_BYTES: usize = 32;
 
 /// Estimated RCP master cycles to decode and dispatch one 64-bit RDP command.
 pub const RDP_CYCLES_PER_CMD: u64 = 8;
-/// RDRAM access cost used when charging DP list DMA and pixel writes (stub; tunable with RI).
-pub const RDRAM_CYCLES_PER_BYTE: u64 = 2;
+/// RDRAM access cost used when charging DP list DMA and pixel writes ([`crate::timing::RDRAM_BUS_CYCLES_PER_BYTE`]).
+pub const RDRAM_CYCLES_PER_BYTE: u64 = RDRAM_BUS_CYCLES_PER_BYTE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColorImage {
@@ -100,6 +101,8 @@ pub struct Rdp {
     pub tmem: Box<[u8; TMEM_SIZE]>,
     /// Commands that were triangles (not rasterized).
     pub triangles_skipped: u64,
+    /// Texels drawn by the last TextureRectangle (debug / tuning).
+    pub texrect_texels: u64,
     /// Other opcodes not handled in software yet.
     pub other_unhandled: u64,
     /// Cycles accumulated for the last `process_display_list` (also returned).
@@ -122,6 +125,7 @@ impl Rdp {
             scissor: Scissor::default(),
             tmem: Box::new([0u8; TMEM_SIZE]),
             triangles_skipped: 0,
+            texrect_texels: 0,
             other_unhandled: 0,
             last_list_cycles: 0,
         }
@@ -139,6 +143,7 @@ impl Rdp {
         dpc_status: u32,
     ) -> u64 {
         self.last_list_cycles = 0;
+        self.texrect_texels = 0;
         let from_xbus = (dpc_status & DPC_STATUS_XBUS_DMEM) != 0;
         let s = (start & 0x00FF_FFF8) as usize;
         let e = (end & 0x00FF_FFF8) as usize;
@@ -150,21 +155,27 @@ impl Rdp {
 
         let mut off = 0usize;
         while off + 8 <= len {
-            let w0 = if from_xbus {
-                rsp_read_be_u32(rsp_dmem, rsp_imem, s + off)
-            } else {
-                read_be_u32_rdram(rdram, s + off)
+            let read_u32 = |rel_off: usize| {
+                let abs = s + rel_off;
+                if from_xbus {
+                    rsp_read_be_u32(rsp_dmem, rsp_imem, abs)
+                } else {
+                    read_be_u32_rdram(rdram, abs)
+                }
             };
-            let w1 = if from_xbus {
-                rsp_read_be_u32(rsp_dmem, rsp_imem, s + off + 4)
-            } else {
-                read_be_u32_rdram(rdram, s + off + 4)
-            };
+            let w0 = read_u32(off);
+            let w1 = read_u32(off + 4);
             let op = (w0 >> 24) as u8;
             cycles = cycles.saturating_add(RDP_CYCLES_PER_CMD);
             let advance = if (TRI_CMD_MIN..=TRI_CMD_MAX).contains(&op) {
                 self.triangles_skipped = self.triangles_skipped.saturating_add(1);
                 TRIANGLE_CMD_STUB_BYTES
+            } else if (op == OP_TEXRECT || op == OP_TEXRECT_FLIP) && off + 16 <= len {
+                let w2 = read_u32(off + 8);
+                let w3 = read_u32(off + 12);
+                let flip = op == OP_TEXRECT_FLIP;
+                cycles = cycles.saturating_add(self.texture_rectangle(rdram, w0, w1, w2, w3, flip));
+                16
             } else {
                 match op {
                     OP_SET_COLOR_IMAGE => self.set_color_image(w0, w1),
@@ -182,6 +193,7 @@ impl Rdp {
                         cycles = cycles.saturating_add(self.load_block(rdram, w0, w1));
                     }
                     OP_SYNC_FULL | OP_SYNC_PIPE | OP_SYNC_TILE => {}
+                    OP_SET_TILE | OP_SET_TILE_SIZE => {}
                     OP_TEXRECT | OP_TEXRECT_FLIP => {
                         self.other_unhandled = self.other_unhandled.saturating_add(1);
                     }
@@ -379,6 +391,104 @@ impl Rdp {
         }
         pix.saturating_mul(bpp as u64 * RDRAM_CYCLES_PER_BYTE)
     }
+
+    /// `TextureRectangle` / `TextureRectangleFlip`: two 64-bit words (screen + tile), then s/t/dsdx/dtdy.
+    /// Nearest-neighbor sample from TMEM; derivatives are in the same fixed-point scale as hardware s/t (s10.5).
+    fn texture_rectangle(
+        &mut self,
+        rdram: &mut [u8],
+        w0: u32,
+        w1: u32,
+        w2: u32,
+        w3: u32,
+        flip: bool,
+    ) -> u64 {
+        let xh_fp = ((w0 >> 12) & 0xFFF) as i32;
+        let yh_fp = (w0 & 0xFFF) as i32;
+        let xl_fp = ((w1 >> 12) & 0xFFF) as i32;
+        let yl_fp = (w1 & 0xFFF) as i32;
+        let px0 = (xh_fp >> 2).min(xl_fp >> 2);
+        let px1 = (xh_fp >> 2).max(xl_fp >> 2);
+        let py0 = (yh_fp >> 2).min(yl_fp >> 2);
+        let py1 = (yh_fp >> 2).max(yl_fp >> 2);
+
+        let mut x_start = px0;
+        let mut x_end = px1.saturating_add(1);
+        let mut y_start = py0;
+        let mut y_end = py1.saturating_add(1);
+
+        if self.scissor.enabled {
+            let sx0 = (self.scissor.xh as i32) >> 2;
+            let sy0 = (self.scissor.yh as i32) >> 2;
+            let sx1 = (self.scissor.xl as i32) >> 2;
+            let sy1 = (self.scissor.yl as i32) >> 2;
+            let sxa = sx0.min(sx1);
+            let sxb = sx0.max(sx1).saturating_add(1);
+            let sya = sy0.min(sy1);
+            let syb = sy0.max(sy1).saturating_add(1);
+            x_start = x_start.max(sxa);
+            y_start = y_start.max(sya);
+            x_end = x_end.min(sxb);
+            y_end = y_end.min(syb);
+        }
+
+        let tile = ((w1 >> 24) & 7) as usize;
+        let tmem_base = tile.saturating_mul(512).min(TMEM_SIZE.saturating_sub(64));
+
+        let s0 = ((w2 >> 16) as i16) as i64;
+        let t0 = ((w2 & 0xFFFF) as i16) as i64;
+        let dsdx = ((w3 >> 16) as i16) as i64;
+        let dtdy = ((w3 & 0xFFFF) as i16) as i64;
+
+        let tw = self.texture_image.width.max(1) as usize;
+        let bpp_tex = texel_bytes(self.texture_image.size);
+        let bpp_fb = texel_bytes(self.color_image.size);
+        let cw = self.color_image.width.max(1) as i32;
+        let base = (self.color_image.addr & 0x00FF_FFFF) as usize;
+
+        let mut pix = 0u64;
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                if x < 0 || y < 0 {
+                    continue;
+                }
+                let xu = x as usize;
+                let yu = y as usize;
+                let (s_acc, t_acc) = if !flip {
+                    let s_acc = s0 + (x as i64 - px0 as i64) * dsdx;
+                    let t_acc = t0 + (y as i64 - py0 as i64) * dtdy;
+                    (s_acc, t_acc)
+                } else {
+                    // Transpose mapping (approximation for sprite flips; refine against hardware later).
+                    let s_acc = s0 + (y as i64 - py0 as i64) * dsdx;
+                    let t_acc = t0 + (x as i64 - px0 as i64) * dtdy;
+                    (s_acc, t_acc)
+                };
+                let ts = (s_acc >> 5).max(0) as usize;
+                let tt = (t_acc >> 5).max(0) as usize;
+                let off_tm = tmem_base.saturating_add((tt * tw + ts).saturating_mul(bpp_tex));
+                if off_tm + bpp_tex > TMEM_SIZE {
+                    continue;
+                }
+                let texel16 = if bpp_tex >= 2 {
+                    u16::from_be_bytes([self.tmem[off_tm], self.tmem[off_tm + 1]])
+                } else {
+                    continue;
+                };
+
+                let off_fb = base.saturating_add((yu * cw as usize + xu) * bpp_fb);
+                if bpp_fb == 2 && off_fb + 2 <= rdram.len() {
+                    rdram[off_fb..off_fb + 2].copy_from_slice(&texel16.to_be_bytes());
+                } else if bpp_fb == 4 && off_fb + 4 <= rdram.len() {
+                    let w = (texel16 as u32) << 16 | texel16 as u32;
+                    rdram[off_fb..off_fb + 4].copy_from_slice(&w.to_be_bytes());
+                }
+                pix = pix.saturating_add(1);
+            }
+        }
+        self.texrect_texels = self.texrect_texels.saturating_add(pix);
+        pix.saturating_mul(bpp_fb as u64 * RDRAM_CYCLES_PER_BYTE)
+    }
 }
 
 #[inline]
@@ -415,5 +525,46 @@ mod tests {
         let w = 320usize;
         let o = base + (1 * w + 1) * 2;
         assert_eq!(u16::from_be_bytes([rdram[o], rdram[o + 1]]), 0xFFFF);
+    }
+
+    #[test]
+    fn texture_rectangle_nearest_two_texels() {
+        let mut rdp = Rdp::new();
+        let mut rdram = vec![0u8; 0x20_0000];
+        rdp.color_image = ColorImage {
+            fmt: 0,
+            size: 2,
+            width: 320,
+            addr: 0x10_0000,
+        };
+        rdp.texture_image = TextureImage {
+            fmt: 0,
+            size: 2,
+            width: 4,
+            addr: 0,
+        };
+        rdp.tmem[0..2].copy_from_slice(&0xABCDu16.to_be_bytes());
+        rdp.tmem[2..4].copy_from_slice(&0x1234u16.to_be_bytes());
+
+        let list_base = 0x1000usize;
+        // xh,yh = 0; xl,yl = 4,0 → 10.2 corners map to pixels x=0 and x=1 (two columns).
+        let w0 = ((OP_TEXRECT as u32) << 24) | ((0 & 0xFFF) << 12) | (0 & 0xFFF);
+        let w1 = ((0u32 & 7) << 24) | ((4 & 0xFFF) << 12) | (0 & 0xFFF);
+        let w2 = 0u32;
+        let w3 = (32i16 as u16 as u32) << 16 | 32i16 as u16 as u32;
+        for (i, w) in [w0, w1, w2, w3].iter().enumerate() {
+            rdram[list_base + i * 4..list_base + i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+        }
+
+        let c = rdp.process_display_list(&mut rdram, &[], &[], list_base as u32, (list_base + 16) as u32, 0);
+        assert!(c > 0);
+        assert_eq!(rdp.texrect_texels, 2);
+
+        let base = 0x10_0000usize;
+        let w = 320usize;
+        let o0 = base + (0 * w + 0) * 2;
+        let o1 = base + (0 * w + 1) * 2;
+        assert_eq!(u16::from_be_bytes([rdram[o0], rdram[o0 + 1]]), 0xABCD);
+        assert_eq!(u16::from_be_bytes([rdram[o1], rdram[o1 + 1]]), 0x1234);
     }
 }

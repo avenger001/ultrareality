@@ -66,7 +66,9 @@ pub use vi::{
     VI_REG_WIDTH, VI_REGS_BASE, VI_REGS_LEN, VI_RDRAM_CYCLES_PER_BYTE,
 };
 pub use timing::{
-    ai_pcm_buffer_cycles, pi_cart_dma_total_cycles, sp_rsp_dma_total_cycles, RCP_MASTER_HZ_NTSC,
+    ai_pcm_buffer_cycles, pi_cart_dma_total_cycles, sp_rsp_dma_total_cycles,
+    MasterCycles, RDRAM_BUS_CYCLES_PER_BYTE, RCP_MASTER_HZ_NTSC, SI_DMA_64_BLOCK_CYCLES,
+    VI_NTSC_ACTIVE_SCANLINES,
 };
 pub use present::{
     graphics_phase_reached, run_wgpu_loop, GraphicsPhase, PresentError, WgpuPresenter,

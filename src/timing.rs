@@ -1,24 +1,36 @@
 //! RCP master-clock timing (NTSC).
 //!
-//! The VR4300 and RCP I/O blocks share a **93.75 MHz** system clock on NTSC units. [`Machine`](crate::Machine)
-//! advances [`SystemBus::rcp_advance_dma_in_flight`](crate::bus::SystemBus::rcp_advance_dma_in_flight),
-//! [`SystemBus::drain_deferred_cycles`](crate::bus::SystemBus::drain_deferred_cycles), and
-//! [`Vi::advance`](crate::vi::Vi::advance) in **RCP cycles** so the VI frame counter, PI/SI/AI DMA,
-//! and other deferred work share one timeline.
+//! ## Lockstep with [`crate::Machine`]
 //!
-//! Values here are **first-order** models: PI cart throughput follows published ~5 MiB/s averages;
-//! SI and AI use conservative stand-ins until measured against hardware or test ROMs (e.g.
-//! [n64_pi_dma_test](https://github.com/rasky/n64_pi_dma_test)).
+//! Retail VR4300 and RCP I/O run from the same **93.75 MHz** crystal. The CPU interpreter retires
+//! abstract “pipeline cycles” ([`crate::cycles`]); each [`crate::Machine::step`] adds those retired
+//! cycles plus any deferred VI/RDP debt ([`crate::bus::SystemBus::drain_deferred_cycles`]), then
+//! applies that **single** `delta` to every in-flight peripheral in parallel:
+//! [`SystemBus::rcp_advance_dma_in_flight`](crate::bus::SystemBus::rcp_advance_dma_in_flight) and
+//! [`SystemBus::advance_vi_frame_timing`](crate::bus::SystemBus::advance_vi_frame_timing). So
+//! `master_cycles`, `Count`, PI/SI/AI/SP/DPC timers, and VI field time all advance on one RCP
+//! timeline — **not** instant completion on register writes.
+//!
+//! Constants below are **RCP master cycles** (denominator [`RCP_MASTER_HZ_NTSC`]) unless noted.
+//! PI cart throughput follows published ~5 MiB/s averages; SI PIF DMA uses the ~3.3 MiB/s figure from
+//! [n64brew](https://n64brew.dev/wiki/Serial_Interface); AI PCM duration matches 44.1 kHz stereo
+//! 16‑bit consumption. SP display-list RDRAM traffic uses [`RDRAM_BUS_CYCLES_PER_BYTE`].
 
 use crate::rcp::sp_dma_decode;
 
 /// NTSC CPU / RCP I/O master frequency (Hz).
 pub const RCP_MASTER_HZ_NTSC: u64 = 93_750_000;
 
+/// RCP master-cycle count (93.75 MHz NTSC): same unit as [`crate::Machine::master_cycles`].
+pub type MasterCycles = u64;
+
 // --- Video Interface (VI) ----------------------------------------------------
 
-/// Vertical interrupt period for ~59.94 Hz NTSC: matches `93_750_000 / 59.940059…` within integer rounding.
-pub const VI_NTSC_CYCLES_PER_FRAME: u64 = 1_564_062;
+/// Vertical interrupt period for ~59.94 Hz NTSC: `RCP_MASTER_HZ_NTSC * 1001 / 60000` (MPEG NTSC rate).
+pub const VI_NTSC_CYCLES_PER_FRAME: u64 = RCP_MASTER_HZ_NTSC * 1001 / 60_000;
+
+/// Active scanlines used to spread [`VI_V_INTR`](crate::vi::VI_REG_V_INTR) within a field (uniform stub).
+pub const VI_NTSC_ACTIVE_SCANLINES: u64 = 262;
 
 // --- Parallel Interface (PI), cartridge ROM DMA ------------------------------
 
@@ -34,13 +46,26 @@ pub fn pi_cart_dma_total_cycles(byte_len: u64) -> u64 {
     byte_len.saturating_mul(PI_ROM_DMA_CYCLES_PER_BYTE)
 }
 
+// --- RDRAM (bus occupancy for RDP list DMA / VI fetch; no Rambus serial model) ---
+
+/// RCP cycles billed per RDRAM byte for coarse bandwidth (VI blit, RDP list read/write stub).
+pub const RDRAM_BUS_CYCLES_PER_BYTE: u64 = 2;
+
 // --- Serial Interface (SI), 64-byte PIF block -------------------------------
 
-/// RCP cycles per byte for SI PIF DMA (stub: order-of-magnitude; PIF is slower than PI cart).
-pub const SI_DMA_CYCLES_PER_BYTE: u64 = 10;
+/// Documented effective PIF DMA throughput (~3.3 MiB/s, [n64brew: Serial Interface](https://n64brew.dev/wiki/Serial_Interface)).
+pub const SI_PIF_DMA_BYTES_PER_SEC: u64 = 3_460_300;
+
+/// RCP cycles per byte: ceil(`RCP_MASTER_HZ_NTSC` / [`SI_PIF_DMA_BYTES_PER_SEC`]).
+pub const SI_DMA_CYCLES_PER_BYTE: u64 =
+    (RCP_MASTER_HZ_NTSC + SI_PIF_DMA_BYTES_PER_SEC - 1) / SI_PIF_DMA_BYTES_PER_SEC;
+
+/// Fixed cost before the 64-byte payload (address / control phase; first-order).
+pub const SI_DMA_64_BLOCK_OVERHEAD_CYCLES: u64 = 48;
 
 /// Total RCP cycles for one 64-byte SI DMA (`RD64B` / `WR64B`).
-pub const SI_DMA_64_BLOCK_CYCLES: u64 = 64 * SI_DMA_CYCLES_PER_BYTE;
+pub const SI_DMA_64_BLOCK_CYCLES: u64 =
+    SI_DMA_64_BLOCK_OVERHEAD_CYCLES.saturating_add(64 * SI_DMA_CYCLES_PER_BYTE);
 
 // --- Audio Interface (AI) ---------------------------------------------------
 
@@ -79,6 +104,12 @@ mod tests {
     fn pi_cycles_per_byte_matches_throughput() {
         assert_eq!(PI_ROM_DMA_CYCLES_PER_BYTE, 18);
         assert_eq!(pi_cart_dma_total_cycles(1024), 1024 * 18);
+    }
+
+    #[test]
+    fn si_dma_derived_from_pif_throughput() {
+        assert_eq!(SI_DMA_CYCLES_PER_BYTE, 28);
+        assert!(SI_DMA_64_BLOCK_CYCLES > 64 * SI_DMA_CYCLES_PER_BYTE);
     }
 
     #[test]

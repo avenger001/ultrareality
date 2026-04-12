@@ -1,10 +1,13 @@
-//! Cycle costs for retired R4300i operations.
+//! Cycle costs for retired VR4300 operations.
 //!
-//! Values follow the simplified “best case” single-issue model from VR4300
-//! documentation: most integer ops retire in one cycle when the pipeline is
-//! full; multiply/divide occupy the MDU for several cycles; memory ops pay
-//! whatever the bus model charges (here, a flat latency until the cache/bus
-//! layer is modeled).
+//! Values follow a simplified single-issue model: most integer ops cost one
+//! cycle; multiply/divide use MDU latencies; loads/stores use a flat L1-hit
+//! stand-in until caches are modeled.
+//!
+//! On retail N64 the VR4300 core runs at **93.75 MHz**, the same as the RCP
+//! master clock. [`crate::Machine::step`] therefore adds each instruction’s
+//! retired cost plus deferred VI/RDP debt into **one** RCP timeline — see
+//! [`crate::timing`] — without an extra CPU↔RCP frequency scaler.
 
 /// One-cycle integer / logical operations (ideal pipeline).
 pub const ALU: u64 = 1;

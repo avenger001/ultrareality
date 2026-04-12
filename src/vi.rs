@@ -46,11 +46,11 @@ pub const VI_OFF_Y_SCALE: u32 = vi_reg_byte_off(VI_REG_Y_SCALE);
 
 /// NTSC ~59.94 Hz vertical interrupt; RCP cycles per field ([`crate::timing::RCP_MASTER_HZ_NTSC`]).
 pub const VI_NTSC_CYCLES_PER_FRAME: u64 = crate::timing::VI_NTSC_CYCLES_PER_FRAME;
-/// Stub: treat a frame as 262 active scanlines for `VI_V_CURRENT` scaling.
-pub const VI_NTSC_SCANLINES: u64 = 262;
+/// Stub: treat a frame as [`crate::timing::VI_NTSC_ACTIVE_SCANLINES`] lines for `VI_V_CURRENT` scaling.
+pub const VI_NTSC_SCANLINES: u64 = crate::timing::VI_NTSC_ACTIVE_SCANLINES;
 
-/// RDRAM cycles charged per byte for VI framebuffer readout (no serial Rambus model; scales with [`Vi::charge_framebuffer_fetch_rgba16_pixels`]).
-pub const VI_RDRAM_CYCLES_PER_BYTE: u64 = 2;
+/// RDRAM cycles charged per byte for VI framebuffer readout ([`crate::timing::RDRAM_BUS_CYCLES_PER_BYTE`]).
+pub const VI_RDRAM_CYCLES_PER_BYTE: u64 = crate::timing::RDRAM_BUS_CYCLES_PER_BYTE;
 
 #[derive(Debug)]
 pub struct Vi {
