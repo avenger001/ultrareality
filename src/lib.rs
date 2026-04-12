@@ -15,18 +15,23 @@ pub mod machine;
 pub mod mi;
 pub mod pi;
 pub mod pif;
+pub mod rcp;
 pub mod si;
 pub mod vi;
 pub mod video;
 
 pub use ai::Ai;
-pub use boot::{cart_boot_pc, hle_ipl3_load_rom, sign_extend_word32};
+pub use boot::{cart_boot_pc, ipl3_load_via_pi_dma, sign_extend_word32};
 pub use bus::{Bus, PhysicalMemory, SystemBus, virt_to_phys, virt_to_phys_rdram};
 pub use cpu::R4300i;
 pub use machine::Machine;
-pub use mi::Mi;
+pub use mi::{Mi, MI_INTR_AI, MI_INTR_DP, MI_INTR_PI, MI_INTR_SI, MI_INTR_SP};
 pub use pi::Pi;
-pub use pif::Pif;
+pub use pif::{Pif, PifRomLoadError, PIF_KSEG1_RESET_PC, PIF_ROM_LEN};
+pub use rcp::{
+    sp_dma_decode, sp_dma_end_addresses, DpcRegs, SpRegs, DPC_REG_CURRENT, DPC_REG_END,
+    DPC_REG_START, DPC_REGS_BASE, SP_PC_REGS_BASE, SP_REG_RD_LEN, SP_REGS_BASE,
+};
 pub use si::Si;
 pub use vi::{
     Vi, VI_NTSC_CYCLES_PER_FRAME, VI_REG_ORIGIN, VI_REG_WIDTH,

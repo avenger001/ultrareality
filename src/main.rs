@@ -2,7 +2,7 @@
 
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use minifb::{Key, Window, WindowOptions};
@@ -21,13 +21,68 @@ fn main() {
         return;
     }
     if args.len() < 2 {
-        eprintln!("UltraReality — N64 emulator (early)\n");
-        eprintln!("  ultrareality <game.z64>   — boot ROM and show VI framebuffer");
-        eprintln!("  ultrareality --demo       — synthetic pattern (no ROM)");
+        print_usage();
         std::process::exit(1);
     }
-    let path = Path::new(&args[1]);
-    run_rom(path);
+    let tail: Vec<String> = args[1..].to_vec();
+    let (pif_path, fast_boot, rom_path) = match parse_rom_args(&tail) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            std::process::exit(1);
+        }
+    };
+    run_rom(&rom_path, pif_path.as_deref(), fast_boot);
+}
+
+fn print_usage() {
+    eprintln!("UltraReality — N64 emulator (early)\n");
+    eprintln!("  ultrareality <game.z64>              — cart header PC + IPL3 region via PI DMA");
+    eprintln!("  ultrareality --pif <pif.bin> <game>   — boot CPU from PIF reset (>= {} bytes)", ultrareality::PIF_ROM_LEN);
+    eprintln!("  ultrareality --pif <pif> --fast-boot <game>");
+    eprintln!("    load PIF into memory but use cart-header + IPL3 PI DMA (dev shortcut)");
+    eprintln!("    (or set ULTRAREALITY_PIF; overridden by --pif)");
+    eprintln!("  ultrareality --demo                  — synthetic pattern (no ROM)");
+}
+
+/// After `--demo` is handled, parse optional leading `--pif PATH`, `--fast-boot`, then one ROM path.
+fn parse_rom_args(args: &[String]) -> Result<(Option<PathBuf>, bool, PathBuf), String> {
+    let mut i = 0usize;
+    let mut pif_path = None;
+    let mut fast_boot = false;
+    while i < args.len() {
+        if args[i] == "--pif" {
+            let p = args
+                .get(i + 1)
+                .ok_or_else(|| "missing path after --pif".to_string())?;
+            pif_path = Some(PathBuf::from(p));
+            i += 2;
+            continue;
+        }
+        if args[i] == "--fast-boot" {
+            fast_boot = true;
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let rest = &args[i..];
+    if rest.len() != 1 {
+        return Err(if rest.is_empty() {
+            "missing ROM path".into()
+        } else {
+            "expected exactly one game ROM path (after optional flags)".into()
+        });
+    }
+    if pif_path.is_none() {
+        if let Ok(p) = env::var("ULTRAREALITY_PIF") {
+            if !p.is_empty() {
+                pif_path = Some(PathBuf::from(p));
+            }
+        }
+    }
+    Ok((pif_path, fast_boot, PathBuf::from(&rest[0])))
 }
 
 fn run_demo() {
@@ -73,7 +128,7 @@ fn run_demo() {
     }
 }
 
-fn run_rom(path: &Path) {
+fn run_rom(path: &Path, pif_path: Option<&Path>, fast_boot: bool) {
     let rom = match fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -83,8 +138,28 @@ fn run_rom(path: &Path) {
     };
 
     let mut m = Machine::new();
+    let mut pif_ok = false;
+    if let Some(pp) = pif_path {
+        match fs::read(pp) {
+            Ok(pif_bytes) => {
+                if let Err(e) = m.set_pif_rom(&pif_bytes) {
+                    eprintln!("invalid PIF ROM {:?}: {:?}", pp, e);
+                    std::process::exit(1);
+                }
+                pif_ok = true;
+            }
+            Err(e) => {
+                eprintln!("failed to read PIF {:?}: {}", pp, e);
+                std::process::exit(1);
+            }
+        }
+    }
     m.set_cartridge_rom(rom);
-    m.bootstrap_hle_cart_entry();
+    if pif_ok && !fast_boot {
+        m.bootstrap_from_pif_reset();
+    } else {
+        m.bootstrap_cart_from_rom();
+    }
 
     let title = format!("UltraReality — {}", path.file_name().unwrap_or_default().to_string_lossy());
     let mut window = Window::new(&title, OUT_W, OUT_H, WindowOptions::default()).expect("minifb");

@@ -1,6 +1,7 @@
 //! Parallel Interface (PI): cartridge ROM access and PI DMA into RDRAM.
 
 use crate::bus::{Bus, PhysicalMemory};
+use crate::mi::{Mi, MI_INTR_PI};
 
 /// PI register block base (physical).
 pub const PI_REGS_BASE: u32 = 0x0460_0000;
@@ -69,28 +70,46 @@ impl Pi {
         }
     }
 
-    pub fn write_reg(&mut self, paddr: u32, value: u32, rdram: &mut PhysicalMemory) {
+    pub fn write_reg(&mut self, paddr: u32, value: u32, rdram: &mut PhysicalMemory, mi: &mut Mi) {
         let Some(off) = Self::reg_offset(paddr) else {
             return;
         };
         match off {
             0x00 => self.dram_addr = value,
             0x04 => self.cart_addr = value,
-            0x0C => self.dma_read(rdram, value),
+            0x0C => self.dma_read(rdram, value, mi),
             0x10 => {
-                self.dma_write(rdram, value);
+                self.dma_write(rdram, value, mi);
             }
             _ => {}
         }
     }
 
+    /// Cartridge ROM → RDRAM via the same DMA engine as MMIO (`PI_DRAM_ADDR`, `PI_CART_ADDR`, `PI_RD_LEN`).
+    pub fn dma_cart_segment_to_rdram(
+        &mut self,
+        rdram: &mut PhysicalMemory,
+        cart_bus_addr: u32,
+        rdram_phys: u32,
+        len: u32,
+        mi: &mut Mi,
+    ) {
+        if len == 0 {
+            return;
+        }
+        self.cart_addr = cart_bus_addr;
+        self.dram_addr = rdram_phys;
+        self.dma_read(rdram, len - 1, mi);
+    }
+
     /// PI “read” DMA: cartridge ROM → RDRAM. `len_minus_one` is the value written to PI_RD_LEN.
-    fn dma_read(&mut self, rdram: &mut PhysicalMemory, len_minus_one: u32) {
+    fn dma_read(&mut self, rdram: &mut PhysicalMemory, len_minus_one: u32, mi: &mut Mi) {
         let len = (len_minus_one as u64).saturating_add(1);
         if len == 0 {
             return;
         }
-        self.status |= 1;
+        // bit0 busy, bit1 interrupt (set at completion); clear old interrupt when starting.
+        self.status = (self.status & !2) | 1;
 
         let rdram_mask = (rdram.data.len() as u64).saturating_sub(1);
         let mut dram = (self.dram_addr as u64) & rdram_mask;
@@ -104,14 +123,17 @@ impl Pi {
         }
 
         self.pending_cycles = self.pending_cycles.saturating_add(len.saturating_mul(PI_CYCLES_PER_DMA_BYTE));
-        self.status &= !1;
+        self.status = (self.status & !1) | 2;
+        mi.raise(MI_INTR_PI);
     }
 
     /// PI “write” DMA: RDRAM → cart (save chips). No writable retail ROM; consume cycles only.
-    fn dma_write(&mut self, rdram: &mut PhysicalMemory, len_minus_one: u32) {
+    fn dma_write(&mut self, rdram: &mut PhysicalMemory, len_minus_one: u32, mi: &mut Mi) {
         let len = (len_minus_one as u64).saturating_add(1);
         self.pending_cycles = self.pending_cycles.saturating_add(len.saturating_mul(PI_CYCLES_PER_DMA_BYTE));
         let _ = rdram;
+        self.status |= 2;
+        mi.raise(MI_INTR_PI);
     }
 
     fn read_cart_u8(&self, cart_addr: u32) -> u8 {
@@ -144,6 +166,7 @@ pub fn cart_rom_offset(cart_addr: u32) -> u32 {
 mod tests {
     use super::*;
     use crate::bus::Bus;
+    use crate::mi::Mi;
 
     #[test]
     fn pi_dma_copy_header_to_rdram() {
@@ -152,11 +175,13 @@ mod tests {
 
         let mut pi = Pi::with_rom(rom);
         let mut rdram = PhysicalMemory::new(4 * 1024 * 1024);
+        let mut mi = Mi::new();
         pi.cart_addr = CART_DOM1_ADDR2_BASE + 0x40;
         pi.dram_addr = 0x0000_0000;
 
-        pi.write_reg(PI_REGS_BASE + 0x0C, 3, &mut rdram);
+        pi.write_reg(PI_REGS_BASE + 0x0C, 3, &mut rdram, &mut mi);
 
         assert_eq!(rdram.read_u32(0).unwrap(), 0x8037_0012);
+        assert_ne!(mi.intr & MI_INTR_PI, 0);
     }
 }

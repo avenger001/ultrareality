@@ -1,6 +1,13 @@
-//! HLE bootstrap helpers and ROM header parsing (no real PIF firmware).
+//! ROM header parsing and IPL3 bootstrap using **PI DMA** (same mechanism as hardware after PIF hands off).
+//!
+//! For cold boot from real PIF firmware, use [`crate::Machine::bootstrap_from_pif_reset`] after loading a
+//! PIF dump. The cart fast path ([`ipl3_load_via_pi_dma`]) takes the entry PC from the ROM header (`0x08`)
+//! and copies the IPL3-sized region via [`crate::pi::Pi`] DMA, raising [`crate::mi::MI_INTR_PI`] on
+//! completion like hardware.
 
 use crate::bus::{virt_to_phys, PhysicalMemory};
+use crate::mi::Mi;
+use crate::pi::{Pi, CART_DOM1_ADDR2_BASE};
 
 /// Sign-extend a 32-bit address into the upper canonical MIPS III range.
 #[inline]
@@ -35,13 +42,13 @@ pub fn cart_boot_pc(rom: &[u8]) -> Option<u64> {
     Some(sign_extend_word32(w))
 }
 
-/// HLE stand-in for IPL3: copy the first **1 MiB** of game code from ROM `0x1000` into RDRAM at
-/// the physical address of the boot PC (same work as hardware after PIF). Returns the CPU entry PC.
-pub fn hle_ipl3_load_rom(rom: &[u8], rdram: &mut PhysicalMemory) -> Option<u64> {
-    let pc = cart_boot_pc(rom)?;
+/// IPL3-style load: first **1 MiB** of game ROM from cart offset `0x1000` into RDRAM at the physical
+/// address of the boot PC from the header (`0x08`), using PI “read” DMA (not a host `memcpy`).
+pub fn ipl3_load_via_pi_dma(pi: &mut Pi, rdram: &mut PhysicalMemory, mi: &mut Mi) -> Option<u64> {
+    let pc = cart_boot_pc(&pi.rom)?;
     let dst_phys = virt_to_phys(pc)? as usize;
 
-    let src_remain = rom.len().saturating_sub(IPL3_ROM_DMA_START);
+    let src_remain = pi.rom.len().saturating_sub(IPL3_ROM_DMA_START);
     if src_remain == 0 {
         return Some(pc);
     }
@@ -51,8 +58,8 @@ pub fn hle_ipl3_load_rom(rom: &[u8], rdram: &mut PhysicalMemory) -> Option<u64> 
     if copy_n == 0 {
         return Some(pc);
     }
-    rdram.data[dst_phys..dst_phys + copy_n]
-        .copy_from_slice(&rom[IPL3_ROM_DMA_START..IPL3_ROM_DMA_START + copy_n]);
+    let cart_addr = CART_DOM1_ADDR2_BASE + IPL3_ROM_DMA_START as u32;
+    pi.dma_cart_segment_to_rdram(rdram, cart_addr, dst_phys as u32, copy_n as u32, mi);
     Some(pc)
 }
 
@@ -71,18 +78,24 @@ mod tests {
     }
 
     #[test]
-    fn hle_ipl3_copies_after_header() {
+    fn ipl3_pi_dma_copies_after_header() {
+        use crate::mi::MI_INTR_PI;
+        use crate::pi::Pi;
+
         let mut rom = vec![0u8; 0x2000];
         rom[0x08..0x0C].copy_from_slice(&0x8000_0400u32.to_be_bytes());
         rom[0x1000..0x1004].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
 
         let mut rdram = PhysicalMemory::new(4 * 1024 * 1024);
-        let pc = hle_ipl3_load_rom(&rom, &mut rdram).unwrap();
+        let mut pi = Pi::with_rom(rom);
+        let mut mi = crate::mi::Mi::new();
+        let pc = ipl3_load_via_pi_dma(&mut pi, &mut rdram, &mut mi).unwrap();
         assert_eq!(pc, sign_extend_word32(0x8000_0400));
         assert_eq!(
             u32::from_be_bytes(rdram.data[0x400..0x404].try_into().unwrap()),
             0xDEAD_BEEF
         );
+        assert_ne!(mi.intr & MI_INTR_PI, 0);
     }
 
     #[test]

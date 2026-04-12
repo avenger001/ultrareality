@@ -1,9 +1,15 @@
-//! Physical memory, PI/cartridge, RSP DMEM/IMEM, and RCP MMIO (MI/VI/AI/SI/PIF).
+//! Physical memory, PI/cartridge, RSP DMEM/IMEM, and RCP MMIO (SP/DPC, MI/VI/AI/SI/PIF).
 
 use crate::ai::{Ai, AI_REGS_BASE, AI_REGS_LEN};
-use crate::mi::{Mi, MI_REGS_BASE, MI_REGS_LEN};
+use crate::mi::{Mi, MI_INTR_SP, MI_REGS_BASE, MI_REGS_LEN};
 use crate::pif::{Pif, PIF_ROM_START, PIF_WINDOW_END};
 use crate::pi::{Pi, CART_DOM1_ADDR2_BASE, PI_REGS_BASE};
+use crate::rcp::{
+    sp_dma_decode, sp_dma_end_addresses, DpcRegs, SpRegs, DPC_REGS_BASE, DPC_REGS_LEN,
+    SP_PC_REG_IBIST, SP_PC_REG_PC, SP_PC_REGS_BASE, SP_PC_REGS_LEN, SP_REG_DMA_BUSY,
+    SP_REG_DMA_FULL, SP_REG_RD_LEN, SP_REG_SEMAPHORE, SP_REG_STATUS, SP_REG_WR_LEN,
+    SP_REGS_BASE, SP_REGS_LEN, SP_WORD_DRAM_ADDR, SP_WORD_MEM_ADDR,
+};
 use crate::si::{Si, SI_REGS_BASE, SI_REGS_LEN};
 use crate::vi::{Vi, VI_REGS_BASE, VI_REGS_LEN};
 
@@ -111,6 +117,17 @@ pub struct SystemBus {
     pub si: Si,
     pub pif: Pif,
     pub pi: Pi,
+    pub sp_regs: SpRegs,
+    pub dpc_regs: DpcRegs,
+    /// RSP halted (bit 0 of `SP_STATUS`); cold reset keeps the RSP stopped until software clears halt.
+    pub sp_halted: bool,
+    pub sp_broke: bool,
+    /// `SP_SEMAPHORE` data bit; a read latches 1 until the register is written.
+    pub sp_semaphore: u32,
+    /// `SP_PC` (`0x0408_0000`): RSP scalar PC into IMEM (word-aligned, [`SP_PC_REG_PC`]).
+    pub rsp_pc: u32,
+    /// `SP_IBIST` — stub storage for bring-up.
+    pub rsp_ibist: u32,
 }
 
 impl SystemBus {
@@ -125,6 +142,13 @@ impl SystemBus {
             si: Si::new(),
             pif: Pif::new(),
             pi: Pi::new(),
+            sp_regs: SpRegs::new(),
+            dpc_regs: DpcRegs::new(),
+            sp_halted: true,
+            sp_broke: false,
+            sp_semaphore: 0,
+            rsp_pc: 0,
+            rsp_ibist: 0,
         }
     }
 
@@ -139,6 +163,13 @@ impl SystemBus {
             si: Si::new(),
             pif: Pif::new(),
             pi: Pi::new(),
+            sp_regs: SpRegs::new(),
+            dpc_regs: DpcRegs::new(),
+            sp_halted: true,
+            sp_broke: false,
+            sp_semaphore: 0,
+            rsp_pc: 0,
+            rsp_ibist: 0,
         }
     }
 
@@ -154,6 +185,175 @@ impl SystemBus {
     /// NTSC VI line: accumulate cycles and raise `MI_INTR_VI` each frame (stub).
     pub fn advance_vi_frame_timing(&mut self, cycles: u64) {
         self.vi.advance(cycles, &mut self.mi);
+    }
+
+    #[inline]
+    fn rsp_write_flat(&mut self, flat: usize, b: u8) {
+        let i = flat & 0x1FFF;
+        if i < 0x1000 {
+            self.rsp_dmem[i] = b;
+        } else {
+            self.rsp_imem[i - 0x1000] = b;
+        }
+    }
+
+    #[inline]
+    fn rsp_read_flat(&self, flat: usize) -> u8 {
+        let i = flat & 0x1FFF;
+        if i < 0x1000 {
+            self.rsp_dmem[i]
+        } else {
+            self.rsp_imem[i - 0x1000]
+        }
+    }
+
+    /// RDRAM → RSP DMEM/IMEM (`SP_RD_LEN` write). Uses `SP_MEM_ADDR` / `SP_DRAM_ADDR` already in [`SpRegs`].
+    ///
+    /// Multi-line DMA packs bytes contiguously into RSP memory (13-bit linear DMEM+IMEM, wrapping at 8 KiB),
+    /// while advancing RDRAM by an extra `skip` after each line ([mupen-style](https://github.com/mupen64plus/mupen64plus-core)).
+    fn sp_dma_rdram_to_rsp(&mut self, len_reg: u32) {
+        let (line_bytes, line_count, dram_skip) = sp_dma_decode(len_reg);
+        let mem = self.sp_regs.words[SP_WORD_MEM_ADDR];
+        let dram = self.sp_regs.words[SP_WORD_DRAM_ADDR];
+        let mut dram_p = (dram & 0x00FF_FFFF) as usize;
+        let mut sp_flat =
+            (((mem & 0x1000) != 0) as usize).saturating_mul(0x1000) + (mem & 0xFFF) as usize;
+        let rd_len = self.rdram.data.len();
+
+        for _line in 0..line_count {
+            for _ in 0..line_bytes {
+                let b = if dram_p < rd_len {
+                    self.rdram.data[dram_p]
+                } else {
+                    0
+                };
+                self.rsp_write_flat(sp_flat, b);
+                dram_p = dram_p.saturating_add(1);
+                sp_flat = (sp_flat + 1) & 0x1FFF;
+            }
+            dram_p = dram_p.saturating_add(dram_skip);
+        }
+
+        let (new_mem, new_dram) = sp_dma_end_addresses(mem, dram, line_bytes, line_count, dram_skip);
+        self.sp_regs.words[SP_WORD_MEM_ADDR] = new_mem;
+        self.sp_regs.words[SP_WORD_DRAM_ADDR] = new_dram;
+    }
+
+    /// RSP DMEM/IMEM → RDRAM (`SP_WR_LEN` write).
+    fn sp_dma_rsp_to_rdram(&mut self, len_reg: u32) {
+        let (line_bytes, line_count, dram_skip) = sp_dma_decode(len_reg);
+        let mem = self.sp_regs.words[SP_WORD_MEM_ADDR];
+        let dram = self.sp_regs.words[SP_WORD_DRAM_ADDR];
+        let mut dram_p = (dram & 0x00FF_FFFF) as usize;
+        let mut sp_flat =
+            (((mem & 0x1000) != 0) as usize).saturating_mul(0x1000) + (mem & 0xFFF) as usize;
+        let rd_len = self.rdram.data.len();
+
+        for _line in 0..line_count {
+            for _ in 0..line_bytes {
+                let b = self.rsp_read_flat(sp_flat);
+                if dram_p < rd_len {
+                    self.rdram.data[dram_p] = b;
+                }
+                dram_p = dram_p.saturating_add(1);
+                sp_flat = (sp_flat + 1) & 0x1FFF;
+            }
+            dram_p = dram_p.saturating_add(dram_skip);
+        }
+
+        let (new_mem, new_dram) = sp_dma_end_addresses(mem, dram, line_bytes, line_count, dram_skip);
+        self.sp_regs.words[SP_WORD_MEM_ADDR] = new_mem;
+        self.sp_regs.words[SP_WORD_DRAM_ADDR] = new_dram;
+    }
+
+    fn sp_status_read(&self) -> u32 {
+        let mut v = 0u32;
+        if self.sp_halted {
+            v |= 1;
+        }
+        if self.sp_broke {
+            v |= 2;
+        }
+        v
+    }
+
+    /// `SP_STATUS` write: W1S/W1C pairs for halt and MI `SP` interrupt ([ares RSP](https://github.com/ares-emulator/ares)).
+    fn sp_status_write(&mut self, value: u32) {
+        if (value & 1) != 0 && (value & 2) == 0 {
+            self.sp_halted = false;
+        }
+        if (value & 2) != 0 && (value & 1) == 0 {
+            self.sp_halted = true;
+        }
+        if (value & 4) != 0 {
+            self.sp_broke = false;
+        }
+        if (value & 8) != 0 && (value & 0x10) == 0 {
+            self.mi.clear(MI_INTR_SP);
+        }
+        if (value & 0x10) != 0 && (value & 8) == 0 {
+            self.mi.raise(MI_INTR_SP);
+        }
+    }
+
+    fn sp_read_mmio(&mut self, paddr: u32) -> u32 {
+        let off = paddr.wrapping_sub(SP_REGS_BASE);
+        match off {
+            SP_REG_STATUS => self.sp_status_read(),
+            SP_REG_DMA_FULL | SP_REG_DMA_BUSY => 0,
+            SP_REG_SEMAPHORE => {
+                let r = self.sp_semaphore & 1;
+                self.sp_semaphore = 1;
+                r
+            }
+            _ => self.sp_regs.read(paddr),
+        }
+    }
+
+    fn sp_write_mmio(&mut self, paddr: u32, value: u32) {
+        let off = paddr.wrapping_sub(SP_REGS_BASE);
+        match off {
+            SP_REG_STATUS => self.sp_status_write(value),
+            SP_REG_DMA_FULL | SP_REG_DMA_BUSY => {}
+            SP_REG_SEMAPHORE => {
+                self.sp_semaphore = 0;
+            }
+            SP_REG_RD_LEN => {
+                self.sp_regs.store_u32(paddr, value);
+                if value != 0 {
+                    self.sp_dma_rdram_to_rsp(value);
+                    self.mi.raise(MI_INTR_SP);
+                }
+            }
+            SP_REG_WR_LEN => {
+                self.sp_regs.store_u32(paddr, value);
+                if value != 0 {
+                    self.sp_dma_rsp_to_rdram(value);
+                    self.mi.raise(MI_INTR_SP);
+                }
+            }
+            _ => {
+                self.sp_regs.store_u32(paddr, value);
+            }
+        }
+    }
+
+    fn sp_pc_read(&self, paddr: u32) -> u32 {
+        let o = paddr.wrapping_sub(SP_PC_REGS_BASE) & 0xF;
+        match o {
+            SP_PC_REG_PC => self.rsp_pc,
+            SP_PC_REG_IBIST => self.rsp_ibist,
+            _ => 0,
+        }
+    }
+
+    fn sp_pc_write(&mut self, paddr: u32, value: u32) {
+        let o = paddr.wrapping_sub(SP_PC_REGS_BASE) & 0xF;
+        match o {
+            SP_PC_REG_PC => self.rsp_pc = value & 0xFFC,
+            SP_PC_REG_IBIST => self.rsp_ibist = value,
+            _ => {}
+        }
     }
 
     #[inline]
@@ -208,6 +408,15 @@ impl Bus for SystemBus {
             ];
             return Some(u32::from_be_bytes(b));
         }
+        if (SP_REGS_BASE..SP_REGS_BASE + SP_REGS_LEN as u32).contains(&paddr) {
+            return Some(self.sp_read_mmio(paddr));
+        }
+        if (SP_PC_REGS_BASE..SP_PC_REGS_BASE + SP_PC_REGS_LEN as u32).contains(&paddr) {
+            return Some(self.sp_pc_read(paddr));
+        }
+        if (DPC_REGS_BASE..DPC_REGS_BASE + DPC_REGS_LEN as u32).contains(&paddr) {
+            return Some(self.dpc_regs.read(paddr));
+        }
         if (MI_REGS_BASE..MI_REGS_BASE + MI_REGS_LEN as u32).contains(&paddr) {
             return Some(self.mi.read(paddr));
         }
@@ -249,15 +458,27 @@ impl Bus for SystemBus {
             return;
         }
         if (AI_REGS_BASE..AI_REGS_BASE + AI_REGS_LEN as u32).contains(&paddr) {
-            self.ai.write(paddr, value);
+            self.ai.write(paddr, value, &mut self.mi);
+            return;
+        }
+        if (SP_REGS_BASE..SP_REGS_BASE + SP_REGS_LEN as u32).contains(&paddr) {
+            self.sp_write_mmio(paddr, value);
+            return;
+        }
+        if (SP_PC_REGS_BASE..SP_PC_REGS_BASE + SP_PC_REGS_LEN as u32).contains(&paddr) {
+            self.sp_pc_write(paddr, value);
+            return;
+        }
+        if (DPC_REGS_BASE..DPC_REGS_BASE + DPC_REGS_LEN as u32).contains(&paddr) {
+            self.dpc_regs.write(paddr, value, &mut self.mi);
             return;
         }
         if (PI_REGS_BASE..PI_REGS_BASE + 0x20).contains(&paddr) {
-            self.pi.write_reg(paddr, value, &mut self.rdram);
+            self.pi.write_reg(paddr, value, &mut self.rdram, &mut self.mi);
             return;
         }
         if (SI_REGS_BASE..SI_REGS_BASE + SI_REGS_LEN as u32).contains(&paddr) {
-            self.si.write(paddr, value, &mut self.rdram, &mut self.pif);
+            self.si.write(paddr, value, &mut self.rdram, &mut self.pif, &mut self.mi);
             return;
         }
         if (PIF_ROM_START..PIF_WINDOW_END).contains(&paddr) {
@@ -326,7 +547,12 @@ impl Default for SystemBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mi::MI_VERSION_DEFAULT;
+    use crate::ai::AI_REGS_BASE;
+    use crate::mi::{MI_INTR_AI, MI_INTR_SP, MI_VERSION_DEFAULT};
+    use crate::rcp::{
+        SP_PC_REG_IBIST, SP_PC_REGS_BASE, SP_REG_RD_LEN, SP_REG_SEMAPHORE, SP_REG_STATUS,
+        SP_REGS_BASE,
+    };
 
     #[test]
     fn mi_version_register() {
@@ -335,5 +561,99 @@ mod tests {
             bus.read_u32(0x0430_0004),
             Some(MI_VERSION_DEFAULT)
         );
+    }
+
+    #[test]
+    fn ai_len_write_sets_mi_ai() {
+        let mut bus = SystemBus::with_rdram_size(1024 * 1024);
+        bus.mi.mask = MI_INTR_AI;
+        bus.write_u32(AI_REGS_BASE + 0x04, 0x1000);
+        assert!(bus.mi.cpu_irq_pending());
+    }
+
+    #[test]
+    fn sp_rd_dma_copies_rdram_to_dmem() {
+        let mut bus = SystemBus::with_rdram_size(1024 * 1024);
+        bus.mi.intr = 0;
+        bus.rdram.data[0x100..0x104].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        bus.write_u32(SP_REGS_BASE, 0x0400_0000);
+        bus.write_u32(SP_REGS_BASE + 0x04, 0x0000_0100);
+        bus.write_u32(SP_REGS_BASE + SP_REG_RD_LEN, 3);
+        assert_eq!(&bus.rsp_dmem[0..4], &[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_ne!(bus.mi.intr & MI_INTR_SP, 0);
+    }
+
+    #[test]
+    fn sp_rd_dma_updates_mem_and_dram_addresses() {
+        let mut bus = SystemBus::with_rdram_size(1024 * 1024);
+        bus.mi.intr = 0;
+        bus.rdram.data[0x100..0x104].fill(0x5A);
+        bus.write_u32(SP_REGS_BASE, 0x0400_0000);
+        bus.write_u32(SP_REGS_BASE + 0x04, 0x0000_0100);
+        bus.write_u32(SP_REGS_BASE + SP_REG_RD_LEN, 3);
+        assert_eq!(bus.sp_regs.words[0], 0x0400_0004);
+        assert_eq!(bus.sp_regs.words[1], 0x0000_0104);
+    }
+
+    #[test]
+    fn sp_status_halt_and_clear_mi_via_status() {
+        let mut bus = SystemBus::with_rdram_size(1024 * 1024);
+        assert_eq!(bus.read_u32(SP_REGS_BASE + SP_REG_STATUS), Some(1));
+        bus.write_u32(SP_REGS_BASE + SP_REG_STATUS, 1);
+        assert_eq!(bus.read_u32(SP_REGS_BASE + SP_REG_STATUS), Some(0));
+        bus.mi.raise(MI_INTR_SP);
+        bus.write_u32(SP_REGS_BASE + SP_REG_STATUS, 8);
+        assert_eq!(bus.mi.intr & MI_INTR_SP, 0);
+    }
+
+    #[test]
+    fn sp_semaphore_acquire_and_release() {
+        let mut bus = SystemBus::with_rdram_size(1024 * 1024);
+        assert_eq!(bus.read_u32(SP_REGS_BASE + SP_REG_SEMAPHORE), Some(0));
+        assert_eq!(bus.read_u32(SP_REGS_BASE + SP_REG_SEMAPHORE), Some(1));
+        bus.write_u32(SP_REGS_BASE + SP_REG_SEMAPHORE, 0);
+        assert_eq!(bus.read_u32(SP_REGS_BASE + SP_REG_SEMAPHORE), Some(0));
+    }
+
+    #[test]
+    fn sp_pc_word_aligned_mask() {
+        let mut bus = SystemBus::with_rdram_size(1024 * 1024);
+        bus.write_u32(SP_PC_REGS_BASE, 0xFFFF_FF01);
+        assert_eq!(bus.read_u32(SP_PC_REGS_BASE), Some(0xF00));
+        bus.write_u32(SP_PC_REGS_BASE, 0xFFFF_FFFF);
+        assert_eq!(bus.read_u32(SP_PC_REGS_BASE), Some(0xFFC));
+        bus.write_u32(SP_PC_REGS_BASE, 0x0000_0200);
+        assert_eq!(bus.read_u32(SP_PC_REGS_BASE), Some(0x200));
+        assert_eq!(bus.read_u32(SP_PC_REGS_BASE + SP_PC_REG_IBIST), Some(0));
+        bus.write_u32(SP_PC_REGS_BASE + SP_PC_REG_IBIST, 0x1234_5678);
+        assert_eq!(bus.read_u32(SP_PC_REGS_BASE + SP_PC_REG_IBIST), Some(0x1234_5678));
+    }
+
+    #[test]
+    fn sp_wr_dma_copies_dmem_to_rdram() {
+        let mut bus = SystemBus::with_rdram_size(1024 * 1024);
+        bus.mi.intr = 0;
+        bus.rsp_dmem[0..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        bus.write_u32(SP_REGS_BASE, 0x0400_0000);
+        bus.write_u32(SP_REGS_BASE + 0x04, 0x0000_0200);
+        bus.write_u32(SP_REGS_BASE + SP_REG_WR_LEN, 3);
+        assert_eq!(&bus.rdram.data[0x200..0x204], &[0x11, 0x22, 0x33, 0x44]);
+        assert_ne!(bus.mi.intr & MI_INTR_SP, 0);
+    }
+
+    /// Two 2-byte lines from RDRAM with 8-byte inter-line skip; DMEM receives four contiguous bytes.
+    #[test]
+    fn sp_rd_dma_two_lines_with_rdram_skip() {
+        let mut bus = SystemBus::with_rdram_size(1024 * 1024);
+        bus.mi.intr = 0;
+        bus.rdram.data[0x300] = 0x10;
+        bus.rdram.data[0x301] = 0x11;
+        bus.rdram.data[0x30A] = 0xaa;
+        bus.rdram.data[0x30B] = 0xbb;
+        bus.write_u32(SP_REGS_BASE, 0x0400_0000);
+        bus.write_u32(SP_REGS_BASE + 0x04, 0x0000_0300);
+        bus.write_u32(SP_REGS_BASE + SP_REG_RD_LEN, 0x0080_1001);
+        assert_eq!(&bus.rsp_dmem[0..4], &[0x10, 0x11, 0xaa, 0xbb]);
+        assert_ne!(bus.mi.intr & MI_INTR_SP, 0);
     }
 }

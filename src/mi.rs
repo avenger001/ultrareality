@@ -1,4 +1,7 @@
 //! MIPS Interface (MI): RCP interrupt routing and mode.
+//!
+//! **Acknowledge:** a write to `MI_INTR` (`0x0430_0008`) clears bits that are set in the value
+//! (write-1-to-clear / W1C), matching common N64 behavior.
 
 pub const MI_REGS_BASE: u32 = 0x0430_0000;
 pub const MI_REGS_LEN: usize = 0x10;
@@ -85,5 +88,32 @@ impl Mi {
 impl Default for Mi {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_intr_ack_clears_selected_bits() {
+        let mut mi = Mi::new();
+        mi.raise(MI_INTR_PI | MI_INTR_SI | MI_INTR_VI);
+        mi.write(MI_REGS_BASE + 0x08, MI_INTR_PI);
+        assert_eq!(mi.intr & MI_INTR_PI, 0);
+        assert_ne!(mi.intr & MI_INTR_SI, 0);
+        assert_ne!(mi.intr & MI_INTR_VI, 0);
+        mi.write(MI_REGS_BASE + 0x08, MI_INTR_SI | MI_INTR_VI);
+        assert_eq!(mi.intr, 0);
+    }
+
+    #[test]
+    fn cpu_irq_pending_respects_mask() {
+        let mut mi = Mi::new();
+        mi.raise(MI_INTR_DP);
+        mi.mask = MI_INTR_VI;
+        assert!(!mi.cpu_irq_pending());
+        mi.mask |= MI_INTR_DP;
+        assert!(mi.cpu_irq_pending());
     }
 }

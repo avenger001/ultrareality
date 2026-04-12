@@ -24,12 +24,14 @@ pub const VI_REG_Y_SCALE: usize = 13;
 
 /// NTSC ~59.94 Hz vertical interrupt at 93.75 MHz CPU clock: `93_750_000 / 59.94`.
 pub const VI_NTSC_CYCLES_PER_FRAME: u64 = 1_564_062;
+/// Stub: treat a frame as 262 active scanlines for `VI_V_CURRENT` scaling.
+pub const VI_NTSC_SCANLINES: u64 = 262;
 
 #[derive(Debug)]
 pub struct Vi {
     pub regs: [u32; 14],
-    /// Cycles since last VI interrupt (for `advance`).
-    pub cycle_accum: u64,
+    /// Cycles elapsed within the current frame `[0, VI_NTSC_CYCLES_PER_FRAME)`.
+    pub cycle_in_frame: u64,
     /// Increments each time a full NTSC frame elapses (stub timing).
     pub frame_counter: u64,
 }
@@ -38,19 +40,27 @@ impl Vi {
     pub fn new() -> Self {
         Self {
             regs: [0u32; 14],
-            cycle_accum: 0,
+            cycle_in_frame: 0,
             frame_counter: 0,
         }
     }
 
     /// Add retired cycles; when a frame elapses, raise `MI_INTR_VI` (stub timing).
     pub fn advance(&mut self, cycles: u64, mi: &mut Mi) {
-        self.cycle_accum = self.cycle_accum.saturating_add(cycles);
-        while self.cycle_accum >= VI_NTSC_CYCLES_PER_FRAME {
-            self.cycle_accum -= VI_NTSC_CYCLES_PER_FRAME;
+        self.cycle_in_frame = self.cycle_in_frame.saturating_add(cycles);
+        while self.cycle_in_frame >= VI_NTSC_CYCLES_PER_FRAME {
+            self.cycle_in_frame -= VI_NTSC_CYCLES_PER_FRAME;
             self.frame_counter = self.frame_counter.wrapping_add(1);
             mi.raise(MI_INTR_VI);
         }
+    }
+
+    /// Approximate current vertical line (for `VI_V_CURRENT` reads), 0–261.
+    #[inline]
+    pub fn v_current_line(&self) -> u32 {
+        let line =
+            (self.cycle_in_frame.saturating_mul(VI_NTSC_SCANLINES)) / VI_NTSC_CYCLES_PER_FRAME;
+        (line as u32).min((VI_NTSC_SCANLINES - 1) as u32)
     }
 
     pub fn offset(paddr: u32) -> Option<usize> {
@@ -69,6 +79,9 @@ impl Vi {
             return 0;
         }
         let i = byte_off / 4;
+        if i == VI_REG_V_CURRENT {
+            return self.v_current_line();
+        }
         self.regs.get(i).copied().unwrap_or(0)
     }
 
@@ -80,6 +93,9 @@ impl Vi {
             return;
         }
         let i = byte_off / 4;
+        if i == VI_REG_V_CURRENT {
+            return;
+        }
         if let Some(r) = self.regs.get_mut(i) {
             *r = value;
         }
@@ -124,5 +140,28 @@ mod tests {
         mi.mask = MI_INTR_VI;
         vi.advance(VI_NTSC_CYCLES_PER_FRAME, &mut mi);
         assert!(mi.cpu_irq_pending());
+    }
+
+    #[test]
+    fn v_current_tracks_cycle_in_frame() {
+        let mut vi = Vi::new();
+        let mut mi = Mi::new();
+        assert_eq!(vi.read(VI_REGS_BASE + (VI_REG_V_CURRENT as u32 * 4)), 0);
+        vi.advance(VI_NTSC_CYCLES_PER_FRAME / 2, &mut mi);
+        let mid = vi.read(VI_REGS_BASE + (VI_REG_V_CURRENT as u32 * 4));
+        assert!(
+            mid >= 120 && mid <= 140,
+            "mid-frame V_CURRENT should be ~half of 262 lines, got {mid}"
+        );
+        vi.advance(VI_NTSC_CYCLES_PER_FRAME / 2, &mut mi);
+        assert_eq!(vi.cycle_in_frame, 0);
+        assert_eq!(vi.read(VI_REGS_BASE + (VI_REG_V_CURRENT as u32 * 4)), 0);
+    }
+
+    #[test]
+    fn v_current_register_is_read_only() {
+        let mut vi = Vi::new();
+        vi.write(VI_REGS_BASE + (VI_REG_V_CURRENT as u32 * 4), 0xFFFF_FFFF);
+        assert_ne!(vi.read(VI_REGS_BASE + (VI_REG_V_CURRENT as u32 * 4)), 0xFFFF_FFFF);
     }
 }

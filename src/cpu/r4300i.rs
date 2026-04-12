@@ -1816,6 +1816,46 @@ mod tests {
     }
 
     #[test]
+    fn kuseg_load_maps_via_tlb_16k_pagemask() {
+        use crate::cpu::tlb::TlbEntry;
+
+        let mut cpu = R4300i::new();
+        cpu.reset(0x8000_0000);
+        cpu.cop0.tlb[0] = TlbEntry {
+            page_mask: 0x6000,
+            hi: 0,
+            lo0: 0x7,
+            lo1: 0,
+        };
+        let mut mem = PhysicalMemory::new(1024 * 1024);
+        mem.write_u32(0x2000, 0x1122_3344);
+        write_be32(&mut mem, 0, 0x8C01_2000);
+        assert_eq!(cpu.step(&mut mem, false).unwrap(), cycles::MEM_ACCESS);
+        assert_eq!(cpu.regs[1], i64::from(0x1122_3344u32 as i32) as u64);
+    }
+
+    #[test]
+    fn ksseg_load_maps_via_tlb() {
+        use crate::cpu::tlb::TlbEntry;
+
+        let mut cpu = R4300i::new();
+        cpu.reset(0x8000_0000);
+        cpu.cop0.tlb[0] = TlbEntry {
+            page_mask: 0,
+            hi: 0xC000_0000,
+            lo0: 0x7,
+            lo1: 0,
+        };
+        let mut mem = PhysicalMemory::new(1024 * 1024);
+        mem.write_u32(0x100, 0x55AA_66BB);
+        // `LW $1, 0x100($1)` — rs=1 (0x8C21), not `0x8C01` (rs=$0).
+        write_be32(&mut mem, 0, 0x8C21_0100);
+        cpu.regs[1] = 0xC000_0000;
+        assert_eq!(cpu.step(&mut mem, false).unwrap(), cycles::MEM_ACCESS);
+        assert_eq!(cpu.regs[1], i64::from(0x55AA_66BBu32 as i32) as u64);
+    }
+
+    #[test]
     fn cfc0_ctc0_compare_mirror_mtc0() {
         let mut cpu = R4300i::new();
         cpu.reset(0x8000_0000);

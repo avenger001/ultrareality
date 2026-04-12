@@ -4,9 +4,17 @@
 
 pub const PIF_ROM_START: u32 = 0x1FC0_0000;
 pub const PIF_ROM_LEN: usize = 0x7C0;
+/// VR4300 reset fetch in **kseg1** (uncached PIF ROM), canonical 64-bit PC.
+pub const PIF_KSEG1_RESET_PC: u64 = 0xFFFF_FFFF_BFC0_0000;
 pub const PIF_RAM_START: u32 = 0x1FC0_07C0;
 pub const PIF_RAM_LEN: usize = 64;
 pub const PIF_WINDOW_END: u32 = 0x1FC0_0800;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PifRomLoadError {
+    /// Fewer than [`PIF_ROM_LEN`] bytes (hardware PIF is fixed size).
+    TooShort { got: usize, need: usize },
+}
 
 #[derive(Debug)]
 pub struct Pif {
@@ -20,6 +28,18 @@ impl Pif {
             rom: vec![0u8; PIF_ROM_LEN].into_boxed_slice(),
             ram: [0u8; PIF_RAM_LEN],
         }
+    }
+
+    /// Replace boot ROM contents. Longer dumps (e.g. 2048-byte files) use the first [`PIF_ROM_LEN`] bytes.
+    pub fn replace_rom(&mut self, data: &[u8]) -> Result<(), PifRomLoadError> {
+        if data.len() < PIF_ROM_LEN {
+            return Err(PifRomLoadError::TooShort {
+                got: data.len(),
+                need: PIF_ROM_LEN,
+            });
+        }
+        self.rom.copy_from_slice(&data[..PIF_ROM_LEN]);
+        Ok(())
     }
 
     #[inline]
@@ -77,5 +97,42 @@ impl Pif {
 impl Default for Pif {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_rom_accepts_exact_len() {
+        let mut p = Pif::new();
+        let mut blob = vec![0x5Au8; PIF_ROM_LEN];
+        blob[0] = 0x12;
+        p.replace_rom(&blob).unwrap();
+        assert_eq!(p.rom[0], 0x12);
+        assert_eq!(p.rom[PIF_ROM_LEN - 1], 0x5A);
+    }
+
+    #[test]
+    fn replace_rom_truncates_long_dump() {
+        let mut p = Pif::new();
+        let mut blob = vec![0u8; PIF_ROM_LEN + 64];
+        blob[PIF_ROM_LEN] = 0xEE;
+        p.replace_rom(&blob).unwrap();
+        assert_eq!(p.rom[PIF_ROM_LEN - 1], 0);
+    }
+
+    #[test]
+    fn replace_rom_rejects_short() {
+        let mut p = Pif::new();
+        let r = p.replace_rom(&[1, 2, 3]);
+        assert_eq!(
+            r,
+            Err(PifRomLoadError::TooShort {
+                got: 3,
+                need: PIF_ROM_LEN
+            })
+        );
     }
 }

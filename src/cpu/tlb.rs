@@ -112,7 +112,8 @@ impl TlbEntry {
         }
         let pfn = entry_lo_pfn(lo);
         let off = vaddr & (half.wrapping_sub(1));
-        Ok((pfn << 12) | off)
+        // Use `add`, not `|`: for half > 4 KiB, `off` may set bits that overlap `pfn << 12` if OR-folded.
+        Ok((pfn << 12).wrapping_add(off))
     }
 }
 
@@ -135,4 +136,61 @@ pub fn probe_index(entries: &[TlbEntry; 32], probe_hi: u32) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pagemask_half_size_linux_masks() {
+        assert_eq!(pagemask_half_size(0), 4096);
+        assert_eq!(pagemask_half_size(0x2000), 8 * 1024);
+        assert_eq!(pagemask_half_size(0x6000), 16 * 1024);
+        // `0x7fff_e000 & 0x01ffe000` collapses to the 16 MiB half pattern, not 1 GiB.
+        assert_eq!(pagemask_half_size(0x7fff_e000), 16 * 1024 * 1024);
+        assert_eq!(pagemask_half_size(0x0000_6000 & 0x01ffe000), 16 * 1024);
+        assert_eq!(pagemask_half_size(0x00AA_0000), 4096);
+    }
+
+    #[test]
+    fn translate_respects_16k_half_and_pfn() {
+        let e = TlbEntry {
+            page_mask: 0x6000,
+            hi: 0,
+            lo0: 0x7,
+            lo1: 0,
+        };
+        assert_eq!(e.translate(0x1000, 0, false), Ok(0x1000));
+        assert_eq!(e.translate(0x3000, 0, false), Ok(0x3000));
+        assert!(matches!(e.translate(0x5000, 0, false), Err(MapFault::TlbMiss { .. })));
+
+        let pfn3 = TlbEntry {
+            page_mask: 0x6000,
+            hi: 0,
+            lo0: 0x7 | (3 << 6),
+            lo1: 0,
+        };
+        assert_eq!(pfn3.translate(0x1000, 0, false), Ok(0x4000));
+    }
+
+    #[test]
+    fn probe_index_finds_masked_entry() {
+        let mut entries = [TlbEntry::default(); 32];
+        for i in 0..5 {
+            entries[i] = TlbEntry {
+                page_mask: 0,
+                hi: 0x0010_0000,
+                lo0: 0,
+                lo1: 0,
+            };
+        }
+        entries[5] = TlbEntry {
+            page_mask: 0x6000,
+            hi: 0,
+            lo0: 0x7,
+            lo1: 0,
+        };
+        assert_eq!(probe_index(&entries, 0), Some(5));
+    }
 }

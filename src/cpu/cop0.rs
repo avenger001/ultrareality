@@ -1,5 +1,6 @@
 //! COP0 subset: Status, Cause, EPC — exceptions, **Compare / Count** timer (`Cause.IP7` / `Status.IM7`),
-//! interrupt scaffolding, and a **32-entry TLB** (`kuseg` only; `kseg0`/`kseg1` stay direct-mapped).
+//! interrupt scaffolding, and a **32-entry TLB** (`kuseg` and `ksseg`; `kseg0`/`kseg1` direct-mapped;
+//! `0xE000_0000..` is not TLB-mapped here and yields `AddressError`).
 
 use super::tlb::{MapFault, TlbEntry};
 
@@ -89,6 +90,7 @@ impl Cop0 {
         }
     }
 
+    /// User segment and `ksseg` (`0xC000_0000..=0xDFFF_FFFF`) use the TLB; `kseg3` / `0xE000_0000+` does not.
     #[inline]
     fn maps_via_tlb(v: u32) -> bool {
         v < 0x8000_0000 || (0xC000_0000..=0xDFFF_FFFF).contains(&v)
