@@ -62,14 +62,43 @@ impl Cop1 {
         self.set_fpr_u32(i, v.to_bits());
     }
 
+    /// 64-bit FPR read honoring the Status.FR bit.
+    ///
+    /// In FR=1 mode the 32 FPRs are independent 64-bit registers. In FR=0 mode there
+    /// are only 16 double-precision registers, accessed as even-odd pairs where the
+    /// even slot holds bits [31:0] and the odd slot holds bits [63:32] of the pair.
     #[inline]
-    pub fn fpr_f64(&self, i: usize) -> f64 {
-        f64::from_bits(self.fpr[i])
+    pub fn fpr_u64(&self, i: usize, fr: bool) -> u64 {
+        if fr {
+            self.fpr[i]
+        } else {
+            let base = i & !1;
+            let lo = self.fpr[base] as u32 as u64;
+            let hi = self.fpr[base + 1] as u32 as u64;
+            (hi << 32) | lo
+        }
+    }
+
+    /// 64-bit FPR write honoring the Status.FR bit. See [`fpr_u64`](Self::fpr_u64).
+    #[inline]
+    pub fn set_fpr_u64(&mut self, i: usize, v: u64, fr: bool) {
+        if fr {
+            self.fpr[i] = v;
+        } else {
+            let base = i & !1;
+            self.fpr[base] = u64::from(v as u32);
+            self.fpr[base + 1] = u64::from((v >> 32) as u32);
+        }
     }
 
     #[inline]
-    pub fn set_fpr_f64(&mut self, i: usize, v: f64) {
-        self.fpr[i] = v.to_bits();
+    pub fn fpr_f64(&self, i: usize, fr: bool) -> f64 {
+        f64::from_bits(self.fpr_u64(i, fr))
+    }
+
+    #[inline]
+    pub fn set_fpr_f64(&mut self, i: usize, v: f64, fr: bool) {
+        self.set_fpr_u64(i, v.to_bits(), fr);
     }
 
     /// Condition code 0 (FCSR bit 23), used by `BC1F` / `BC1T`.

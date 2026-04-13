@@ -12,6 +12,8 @@ pub const STATUS_EXL: u32 = 1 << 1;
 pub const STATUS_ERL: u32 = 1 << 2;
 /// Status: bootstrap exception vectors (BEV).
 pub const STATUS_BEV: u32 = 1 << 22;
+/// Status: interrupt mask 2 — enables external RCP interrupt (`Cause.IP2`).
+pub const STATUS_IM2: u32 = 1 << 10;
 /// Status: interrupt mask 7 — enables **Compare** / timer (`Cause.IP7`).
 pub const STATUS_IM7: u32 = 1 << 15;
 
@@ -36,8 +38,12 @@ pub const EXCCODE_ADEL: u32 = 4;
 /// Address error on store.
 pub const EXCCODE_ADES: u32 = 5;
 
+/// Cause: interrupt pending 2 — external RCP interrupt (N64 MIPS Interface).
+pub const CAUSE_IP2: u32 = 1 << 10;
 /// Cause: interrupt pending 7 — timer (`Count` == `Compare`).
 pub const CAUSE_IP7: u32 = 1 << 15;
+/// Cause: all IP bits mask (bits 15:8).
+pub const CAUSE_IP_MASK: u32 = 0xFF00;
 /// Cause: branch delay — last exception was from a delay slot (`EPC` points at branch).
 pub const CAUSE_BD: u32 = 1 << 31;
 
@@ -47,6 +53,50 @@ pub const KSEG0_INTERRUPT_VECTOR_PC: u64 = 0xFFFF_FFFF_8000_0180;
 pub const KSEG1_BEV_INTERRUPT_VECTOR_PC: u64 = 0xFFFF_FFFF_BFC0_0380;
 /// Byte offset from segment base for those vectors; physical address in low RDRAM is **`0x180`**.
 pub const GENERAL_EXCEPTION_OFFSET: u32 = 0x180;
+
+/// Diagnostic counter for interrupt entries (used by main.rs frame summary).
+pub static INT_TAKEN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Diagnostic: histogram of MI.intr bits set at the moment of each IP2 interrupt take.
+/// Bits 0-5: SP, SI, AI, VI, PI, DP.
+pub static INT_TAKEN_MI_HISTOGRAM: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+];
+/// Diagnostic: Cause.IP value at the moment of each interrupt take (bits 15:8 only — IP[7:0]).
+pub static INT_TAKEN_IP_HISTOGRAM: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+];
+/// Diagnostic counter for actual ERET executions.
+pub static ERET_EXEC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static COMPARE_WRITE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Diagnostic counters for general exceptions, indexed by exccode (0-31).
+pub static GEN_EXC_COUNT: [std::sync::atomic::AtomicU64; 32] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+];
+
+/// TLB refill vector (offset 0x000) for kseg0 when `Status.BEV` is clear.
+pub const KSEG0_TLB_REFILL_VECTOR_PC: u64 = 0xFFFF_FFFF_8000_0000;
+/// TLB refill vector (offset 0x200) for kseg1 when `Status.BEV` is set.
+pub const KSEG1_BEV_TLB_REFILL_VECTOR_PC: u64 = 0xFFFF_FFFF_BFC0_0200;
 
 /// `break` instruction word (special `0` / funct `0x0D`) — minimal handler placeholder in tests.
 pub const MIPS_OPCODE_BREAK: u32 = 0x0000_000D;
@@ -72,6 +122,10 @@ pub struct Cop0 {
     pub page_mask: u32,
     /// CP0 r10 — `EntryHi` (VPN2, ASID).
     pub entry_hi: u64,
+    /// CP0 r28 — `TagLo`: primary cache tag for CACHE index ops.
+    pub taglo: u32,
+    /// CP0 r29 — `TagHi`: secondary cache tag (unused on VR4300, but readable/writable).
+    pub taghi: u32,
     /// Software TLB: 32 dual pages.
     pub tlb: [TlbEntry; 32],
     /// Instruction count for `Random` / `TLBWR` (not cycle-accurate vs. real Random decrement).
@@ -95,6 +149,8 @@ impl Cop0 {
             entry_lo1: 0,
             page_mask: 0,
             entry_hi: 0,
+            taglo: 0,
+            taghi: 0,
             tlb: [TlbEntry::default(); 32],
             random_tick: 0,
         }
@@ -230,7 +286,27 @@ impl Cop0 {
         }
     }
 
-    /// General exception vector (TLB refill / mod / `SYSCALL` / `BREAK` / …): same base as interrupts.
+    /// Exception vector for the given exception code. TLB refill (TLBL/TLBS) uses offset 0x000
+    /// when `Status.EXL` is 0; all others use offset 0x180.
+    #[inline]
+    pub fn exception_vector(&self, exccode: u32) -> u64 {
+        let is_tlb_refill = (exccode == EXCCODE_TLBL || exccode == EXCCODE_TLBS)
+            && (self.status & STATUS_EXL) == 0;
+        if (self.status & STATUS_BEV) != 0 {
+            if is_tlb_refill {
+                KSEG1_BEV_TLB_REFILL_VECTOR_PC
+            } else {
+                KSEG1_BEV_INTERRUPT_VECTOR_PC
+            }
+        } else if is_tlb_refill {
+            KSEG0_TLB_REFILL_VECTOR_PC
+        } else {
+            KSEG0_INTERRUPT_VECTOR_PC
+        }
+    }
+
+    /// General exception vector (TLB refill / mod / `SYSCALL` / `BREAK` / …): offset 0x180.
+    /// **Deprecated**: Use `exception_vector(exccode)` for correct TLB refill handling.
     #[inline]
     pub fn general_exception_vector(&self) -> u64 {
         self.interrupt_vector()
@@ -267,6 +343,24 @@ impl Cop0 {
         (self.cause & CAUSE_IP7) != 0 && (self.status & STATUS_IM7) != 0
     }
 
+    /// Update external interrupt pending (Cause.IP2) based on RCP interrupt line state.
+    /// This should be called each step before checking for interrupts.
+    #[inline]
+    pub fn set_external_interrupt_pending(&mut self, pending: bool) {
+        if pending {
+            self.cause |= CAUSE_IP2;
+        } else {
+            self.cause &= !CAUSE_IP2;
+        }
+    }
+
+    /// Check if any interrupt is pending and enabled by the corresponding IM bit.
+    /// This ANDs Cause.IP[7:0] with Status.IM[7:0] (both in bits 15:8).
+    #[inline]
+    pub fn any_interrupt_pending_masked(&self) -> bool {
+        (self.cause & self.status & CAUSE_IP_MASK) != 0
+    }
+
     /// Clear timer pending after delivering an interrupt exception (hardware clears edge).
     #[inline]
     pub fn clear_timer_interrupt_pending(&mut self) {
@@ -289,6 +383,7 @@ impl Cop0 {
     /// `ERET` return path (caller assigns `self.pc`).
     #[inline]
     pub fn apply_eret(&mut self) -> u64 {
+        ERET_EXEC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.cause &= !CAUSE_BD;
         if (self.status & STATUS_ERL) != 0 {
             self.status &= !STATUS_ERL;
@@ -319,6 +414,8 @@ impl Cop0 {
                 // PRId — VR4300 (games read COP0 r15; not EPC high).
                 0x0B00_0002
             }
+            28 => self.taglo,
+            29 => self.taghi,
             30 => self.error_epc as u32,
             31 => (self.error_epc >> 32) as u32,
             _ => 0,
@@ -336,6 +433,10 @@ impl Cop0 {
             10 => self.entry_hi = (self.entry_hi & !0xFFFF_FFFF) | u64::from(value),
             // Writing `Compare` clears the timer interrupt (VR4300).
             11 => {
+                let n = COMPARE_WRITE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 30 {
+                    eprintln!("[COMPARE_WRITE #{}] count={} old={} new={}", n, self.count, self.compare, value);
+                }
                 self.compare = value;
                 self.cause &= !CAUSE_IP7;
             }
@@ -343,6 +444,8 @@ impl Cop0 {
             13 => self.cause = value,
             14 => self.epc = (self.epc & !0xFFFF_FFFF) | u64::from(value),
             15 => self.epc = (self.epc & 0xFFFF_FFFF) | (u64::from(value) << 32),
+            28 => self.taglo = value,
+            29 => self.taghi = value,
             30 => self.error_epc = (self.error_epc & !0xFFFF_FFFF) | u64::from(value),
             31 => self.error_epc = (self.error_epc & 0xFFFF_FFFF) | (u64::from(value) << 32),
             _ => {}
@@ -384,6 +487,10 @@ impl Cop0 {
             9 => self.count = v as u32,
             10 => self.entry_hi = v,
             11 => {
+                let n = COMPARE_WRITE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 30 {
+                    eprintln!("[COMPARE_WRITE64 #{}] count={} old={} new={}", n, self.count, self.compare, v as u32);
+                }
                 self.compare = v as u32;
                 self.cause &= !CAUSE_IP7;
             }

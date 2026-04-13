@@ -86,9 +86,43 @@ impl Mi {
             return;
         };
         match off {
-            MI_REG_MODE => self.mode = value,
+            MI_REG_MODE => {
+                // MI_MODE write decode (n64brew MIPS Interface):
+                //   bits 0–6  init mode length (stored)
+                //   bit  7    clear init mode
+                //   bit  8    set   init mode
+                //   bit  9    clear EBUS test mode
+                //   bit  10   set   EBUS test mode
+                //   bit  11   clear DP interrupt   ← libultra's __osDpSetNextBuffer/handler ack path
+                //   bit  12   clear RDRAM register mode
+                //   bit  13   set   RDRAM register mode
+                // Mode register state below tracks bits 7–13 separately from the
+                // raw store; the init-length field stays in the low 7 bits.
+                self.mode = (self.mode & !0x7F) | (value & 0x7F);
+                if value & (1 << 7)  != 0 { self.mode &= !(1 << 7); }
+                if value & (1 << 8)  != 0 { self.mode |=  1 << 7;  }
+                if value & (1 << 9)  != 0 { self.mode &= !(1 << 9); }
+                if value & (1 << 10) != 0 { self.mode |=  1 << 9;  }
+                if value & (1 << 11) != 0 { self.intr &= !MI_INTR_DP; }
+                if value & (1 << 12) != 0 { self.mode &= !(1 << 13); }
+                if value & (1 << 13) != 0 { self.mode |=  1 << 13;  }
+            }
             MI_REG_INTR => self.intr &= !value,
-            MI_REG_INTR_MASK => self.mask = value,
+            MI_REG_INTR_MASK => {
+                // Set/clear bit pairs: even bits clear, odd bits set
+                // Bit 0/1 = SP, 2/3 = SI, 4/5 = AI, 6/7 = VI, 8/9 = PI, 10/11 = DP
+                for i in 0..6 {
+                    let clear_bit = 1 << (i * 2);     // even: clear
+                    let set_bit = 1 << (i * 2 + 1);   // odd: set
+                    let mask_bit = 1 << i;            // actual mask bit
+                    if value & clear_bit != 0 {
+                        self.mask &= !mask_bit;
+                    }
+                    if value & set_bit != 0 {
+                        self.mask |= mask_bit;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -117,11 +151,21 @@ mod tests {
     }
 
     #[test]
-    fn mode_register_round_trip() {
+    fn mode_init_length_writes_through_low_bits() {
         let mut mi = Mi::new();
-        assert_eq!(mi.read(MI_REGS_BASE + MI_REG_MODE), 0);
-        mi.write(MI_REGS_BASE + MI_REG_MODE, 0x1234_5678);
-        assert_eq!(mi.read(MI_REGS_BASE + MI_REG_MODE), 0x1234_5678);
+        // Low 7 bits = init mode length
+        mi.write(MI_REGS_BASE + MI_REG_MODE, 0x3F);
+        assert_eq!(mi.read(MI_REGS_BASE + MI_REG_MODE) & 0x7F, 0x3F);
+    }
+
+    #[test]
+    fn mode_write_bit11_clears_dp_interrupt() {
+        let mut mi = Mi::new();
+        mi.raise(MI_INTR_DP | MI_INTR_VI);
+        // bit 11 of MI_MODE write acks DP IRQ on real hardware
+        mi.write(MI_REGS_BASE + MI_REG_MODE, 1 << 11);
+        assert_eq!(mi.intr & MI_INTR_DP, 0);
+        assert_ne!(mi.intr & MI_INTR_VI, 0, "VI must not be touched");
     }
 
     #[test]
@@ -132,5 +176,22 @@ mod tests {
         assert!(!mi.cpu_irq_pending());
         mi.mask |= MI_INTR_DP;
         assert!(mi.cpu_irq_pending());
+    }
+
+    #[test]
+    fn intr_mask_set_clear_pairs() {
+        let mut mi = Mi::new();
+        // Set VI mask (bit 7)
+        mi.write(MI_REGS_BASE + MI_REG_INTR_MASK, 0x80);
+        assert_eq!(mi.mask, MI_INTR_VI);
+        // Set SP mask (bit 1)
+        mi.write(MI_REGS_BASE + MI_REG_INTR_MASK, 0x02);
+        assert_eq!(mi.mask, MI_INTR_VI | MI_INTR_SP);
+        // Clear VI mask (bit 6)
+        mi.write(MI_REGS_BASE + MI_REG_INTR_MASK, 0x40);
+        assert_eq!(mi.mask, MI_INTR_SP);
+        // Set and clear in same write: set wins (odd bit processed after even)
+        mi.write(MI_REGS_BASE + MI_REG_INTR_MASK, 0x03); // clear SP (0x01), set SP (0x02)
+        assert_eq!(mi.mask, MI_INTR_SP); // set wins
     }
 }

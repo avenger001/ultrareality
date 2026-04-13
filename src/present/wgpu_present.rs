@@ -21,27 +21,49 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
         vec2<f32>(3.0, -1.0),
         vec2<f32>(-1.0, 3.0),
     );
-    var uvs = array<vec2<f32>, 3>(
-        vec2<f32>(0.0, 1.0),
-        vec2<f32>(2.0, 1.0),
-        vec2<f32>(0.0, -1.0),
-    );
     var o: VertexOutput;
     o.clip_position = vec4<f32>(positions[vi], 0.0, 1.0);
-    o.uv = uvs[vi];
+    o.uv = positions[vi] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
     return o;
 }
 
 @group(0) @binding(0)
-var tex: texture_2d<f32>;
+var frame_tex: texture_2d<f32>;
 @group(0) @binding(1)
-var samp: sampler;
+var frame_samp: sampler;
+@group(0) @binding(2)
+var rdp_aux_tex: texture_2d<f32>;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(tex, samp, in.uv);
+    let fb = textureSample(frame_tex, frame_samp, in.uv);
+    let aux_uv = (in.uv - vec2<f32>(0.62, 0.08)) / vec2<f32>(0.35, 0.35);
+    let aux = textureSample(rdp_aux_tex, frame_samp, aux_uv);
+    let pip = aux_uv.x >= 0.0 && aux_uv.x <= 1.0 && aux_uv.y >= 0.0 && aux_uv.y <= 1.0;
+    if (pip) {
+        return mix(fb, aux, 0.5);
+    }
+    return fb;
 }
 "#;
+
+/// Frame payload for [`run_wgpu_loop`]: main RGBA8 framebuffer plus optional RDP/TMEM overlay for [`WgpuPresenter::upload_and_present`].
+pub struct WgpuFrame {
+    pub rgba: Vec<u8>,
+    /// RGBA8 auxiliary image (e.g. software RDP / TMEM view); width/height must match the presenter `aux_w` / `aux_h` (128×128).
+    pub aux_rgba: Option<(Vec<u8>, u32, u32)>,
+    pub keep_open: bool,
+}
+
+impl WgpuFrame {
+    pub fn new(rgba: Vec<u8>, keep_open: bool) -> Self {
+        Self {
+            rgba,
+            aux_rgba: None,
+            keep_open,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum PresentError {
@@ -57,9 +79,15 @@ pub struct WgpuPresenter {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     texture: wgpu::Texture,
+    rdp_aux_texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+    // Kept so the sampler outlives the bind group (wgpu lifetime).
+    #[allow(dead_code)]
+    sampler: wgpu::Sampler,
     tex_w: u32,
     tex_h: u32,
+    pub aux_w: u32,
+    pub aux_h: u32,
 }
 
 impl WgpuPresenter {
@@ -129,6 +157,9 @@ impl WgpuPresenter {
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
 
+        const AUX_W: u32 = 128;
+        const AUX_H: u32 = 128;
+
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tex_bind"),
             entries: &[
@@ -146,6 +177,16 @@ impl WgpuPresenter {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
@@ -208,6 +249,22 @@ impl WgpuPresenter {
         });
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let rdp_aux_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rdp_aux"),
+            size: wgpu::Extent3d {
+                width: AUX_W,
+                height: AUX_H,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let rdp_aux_view = rdp_aux_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("frame_bg"),
             layout: &bind_group_layout,
@@ -220,6 +277,10 @@ impl WgpuPresenter {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&rdp_aux_view),
+                },
             ],
         });
 
@@ -231,9 +292,13 @@ impl WgpuPresenter {
             config,
             pipeline,
             texture,
+            rdp_aux_texture,
             bind_group,
+            sampler,
             tex_w,
             tex_h,
+            aux_w: AUX_W,
+            aux_h: AUX_H,
         })
     }
 
@@ -254,7 +319,14 @@ impl WgpuPresenter {
         self.surface.configure(&self.device, &self.config);
     }
 
-    pub fn upload_and_present(&mut self, rgba: &[u8], width: u32, height: u32) -> Result<(), PresentError> {
+    /// Upload the main framebuffer; optional `aux` is composited (PIP) when dimensions match [`Self::aux_w`] / [`Self::aux_h`].
+    pub fn upload_and_present(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        aux: Option<(&[u8], u32, u32)>,
+    ) -> Result<(), PresentError> {
         if width != self.tex_w || height != self.tex_h {
             return Err(PresentError::Surface(format!(
                 "frame size {width}x{height} != presenter {}x{}",
@@ -268,6 +340,42 @@ impl WgpuPresenter {
                 rgba.len(),
                 expected
             )));
+        }
+
+        if let Some((adata, aw, ah)) = aux {
+            if aw != self.aux_w || ah != self.aux_h {
+                return Err(PresentError::Surface(format!(
+                    "aux size {aw}x{ah} != presenter aux {}x{}",
+                    self.aux_w, self.aux_h
+                )));
+            }
+            let need = (aw * ah * 4) as usize;
+            if adata.len() < need {
+                return Err(PresentError::Surface(format!(
+                    "aux rgba too short: {} < {}",
+                    adata.len(),
+                    need
+                )));
+            }
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.rdp_aux_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &adata[..need],
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * aw),
+                    rows_per_image: Some(ah),
+                },
+                wgpu::Extent3d {
+                    width: aw,
+                    height: ah,
+                    depth_or_array_layers: 1,
+                },
+            );
         }
 
         self.queue.write_texture(
@@ -335,7 +443,7 @@ pub fn run_wgpu_loop(
     title: &str,
     tex_w: u32,
     tex_h: u32,
-    mut on_frame: impl FnMut() -> (Vec<u8>, bool),
+    mut on_frame: impl FnMut() -> WgpuFrame,
 ) -> Result<(), PresentError> {
     let event_loop = EventLoop::new().map_err(|e| PresentError::WgpuRequest(e.to_string()))?;
     let mut gpu = WgpuPresenter::new(&event_loop, title, tex_w, tex_h)?;
@@ -351,12 +459,16 @@ pub fn run_wgpu_loop(
                     WindowEvent::CloseRequested | WindowEvent::Destroyed => elwt.exit(),
                     WindowEvent::Resized(size) => gpu.resize(size.width, size.height),
                     WindowEvent::RedrawRequested => {
-                        let (rgba, keep_open) = on_frame();
-                        if !keep_open {
+                        let frame = on_frame();
+                        if !frame.keep_open {
                             elwt.exit();
                             return;
                         }
-                        if let Err(e) = gpu.upload_and_present(&rgba, tex_w, tex_h) {
+                        let aux = frame
+                            .aux_rgba
+                            .as_ref()
+                            .map(|(buf, w, h)| (buf.as_slice(), *w, *h));
+                        if let Err(e) = gpu.upload_and_present(&frame.rgba, tex_w, tex_h, aux) {
                             eprintln!("wgpu present: {e:?}");
                             elwt.exit();
                         }

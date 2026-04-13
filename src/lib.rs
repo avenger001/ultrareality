@@ -19,8 +19,11 @@ pub mod pif;
 pub mod present;
 pub mod rcp;
 pub mod rdp;
+pub mod rdp_triangle;
+pub mod rdp_combiner;
 pub mod ri;
 pub mod rsp;
+pub mod rsp_vu;
 pub mod si;
 pub mod timing;
 pub mod vi;
@@ -54,7 +57,8 @@ pub use rcp::{
     SP_REG_DRAM_ADDR, SP_REG_MEM_ADDR, SP_REG_RD_LEN, SP_REG_SEMAPHORE, SP_REG_STATUS,
     SP_REG_WR_LEN, SP_REGS_BASE, SP_REGS_LEN,
 };
-pub use rdp::{Rdp, RDRAM_CYCLES_PER_BYTE, RDP_CYCLES_PER_CMD, TMEM_SIZE};
+pub use rdp::{Rdp, TileSlot, RDRAM_CYCLES_PER_BYTE, RDP_CYCLES_PER_CMD, TMEM_SIZE};
+pub use rdp_combiner::rgba5551_modulate;
 pub use si::{
     Si, SI_REG_DRAM_ADDR, SI_REG_PIF_ADDR_RD64B, SI_REG_PIF_ADDR_WR64B, SI_REG_STATUS, SI_REGS_BASE,
     SI_REGS_LEN,
@@ -63,17 +67,19 @@ pub use vi::{
     vi_reg_byte_off, Vi, VI_NTSC_CYCLES_PER_FRAME, VI_OFF_BURST, VI_OFF_CONTROL, VI_OFF_H_SYNC,
     VI_OFF_H_VIDEO, VI_OFF_LEAP, VI_OFF_ORIGIN, VI_OFF_V_BURST, VI_OFF_V_CURRENT, VI_OFF_V_INTR,
     VI_OFF_V_SYNC, VI_OFF_V_VIDEO, VI_OFF_WIDTH, VI_OFF_X_SCALE, VI_OFF_Y_SCALE, VI_REG_ORIGIN,
-    VI_REG_WIDTH, VI_REGS_BASE, VI_REGS_LEN, VI_RDRAM_CYCLES_PER_BYTE,
+    VI_REG_V_INTR, VI_REG_WIDTH, VI_REGS_BASE, VI_REGS_LEN, VI_RDRAM_CYCLES_PER_BYTE,
 };
 pub use timing::{
-    ai_pcm_buffer_cycles, pi_cart_dma_total_cycles, sp_rsp_dma_total_cycles,
-    MasterCycles, RDRAM_BUS_CYCLES_PER_BYTE, RCP_MASTER_HZ_NTSC, SI_DMA_64_BLOCK_CYCLES,
-    VI_NTSC_ACTIVE_SCANLINES,
+    ai_pcm_buffer_cycles, pi_cart_dma_total_cycles, rdram_byte_cost_from_ri_latency,
+    sp_rsp_dma_total_cycles, MasterCycles, RDRAM_BUS_CYCLES_PER_BYTE, RDRAM_BUS_CYCLES_PER_BYTE_BASE,
+    RCP_MASTER_HZ_NTSC, SI_DMA_64_BLOCK_CYCLES, VI_NTSC_ACTIVE_SCANLINES,
 };
 pub use present::{
-    graphics_phase_reached, run_wgpu_loop, GraphicsPhase, PresentError, WgpuPresenter,
+    graphics_phase_reached, run_wgpu_loop, GraphicsPhase, PresentError, WgpuFrame, WgpuPresenter,
 };
-pub use video::{blit_rgba5551, blit_rgba5551_to_rgba8, pixel_rgba5551_to_argb};
+pub use video::{
+    blit_rgba5551, blit_rgba5551_to_rgba8, pixel_rgba5551_to_argb, tmem_rgba5551_grid_to_rgba8,
+};
 pub use rsp::{
     run_for_rcp_quantum, step_instruction, Rsp, RspState, RSP_CYCLES_PER_INSTR,
 };

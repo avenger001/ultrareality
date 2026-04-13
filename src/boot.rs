@@ -32,8 +32,11 @@ pub const ROM_OFF_BOOT_ADDRESS: usize = 0x08;
 
 /// ROM offset where IPL3 starts copying (after the 4 KiB header + IPL3 slot).
 pub const IPL3_ROM_DMA_START: usize = 0x1000;
-/// IPL3 copies **1 MiB** from [`IPL3_ROM_DMA_START`] into RDRAM at the boot address.
-pub const IPL3_COPY_LEN: usize = 0x0010_0000;
+/// Copy size from ROM to RDRAM during HLE boot.
+/// Real IPL3 copies exactly 1 MiB from ROM offset 0x1000 to the boot PC address.
+/// Loading more would incorrectly fill BSS/data regions that games expect to be empty
+/// and will later populate via PI DMA.
+pub const IPL3_COPY_LEN: usize = 0x0010_0000;  // 1 MiB like real IPL3
 
 /// Boot PC from ROM header word at [`ROM_OFF_BOOT_ADDRESS`] (Boot Address), per [n64brew ROM_Header](https://n64brew.dev/wiki/ROM_Header).
 /// Word at **0x0C** is libultra version metadata, not the entry PC.

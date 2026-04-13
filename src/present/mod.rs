@@ -1,9 +1,9 @@
-//! **Phase 0–1:** Host display output. Default path uses **wgpu** (Vulkan on Windows) to present
-//! RGBA8 frames. See [`GraphicsPhase`] for roadmap stages (RSP → software RDP → GPU path → games).
+//! **Phase 0–4:** Host display via **wgpu** (Vulkan on Windows): main framebuffer plus optional
+//! RDP/TMEM RGBA8 overlay in the presenter. See [`GraphicsPhase`] for roadmap stages.
 
 mod wgpu_present;
 
-pub use wgpu_present::{run_wgpu_loop, PresentError, WgpuPresenter};
+pub use wgpu_present::{run_wgpu_loop, PresentError, WgpuFrame, WgpuPresenter};
 
 /// Roadmap milestones from the graphics plan (core work tracks these over time).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -25,5 +25,5 @@ pub enum GraphicsPhase {
 
 /// Reported progress toward on-screen output (extend as features land).
 pub fn graphics_phase_reached() -> GraphicsPhase {
-    GraphicsPhase::SoftwareRdp
+    GraphicsPhase::VulkanRdp
 }

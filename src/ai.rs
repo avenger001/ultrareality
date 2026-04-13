@@ -13,9 +13,15 @@ pub const AI_REGS_LEN: usize = 0x20;
 pub const AI_REG_DRAM_ADDR: u32 = 0x00;
 /// Byte offset of `AI_LEN` — non-zero write schedules buffer playback and (later) `MI_INTR_AI`.
 pub const AI_REG_LEN: u32 = 0x04;
+/// Byte offset of `AI_CONTROL` — DAC enable.
+pub const AI_REG_CONTROL: u32 = 0x08;
+/// Byte offset of `AI_STATUS` — status bits. Writing any value clears `MI_INTR_AI`.
+pub const AI_REG_STATUS: u32 = 0x0C;
 
 /// Word index of `AI_LEN` in [`Ai::regs`] (same as `AI_REG_LEN / 4`).
 const AI_WORD_INDEX_LEN: usize = 1;
+/// Word index of `AI_STATUS` in [`Ai::regs`].
+const AI_WORD_INDEX_STATUS: usize = 3;
 
 #[derive(Debug, Clone)]
 struct AiPlayback {
@@ -56,7 +62,36 @@ impl Ai {
         if byte_off & 3 != 0 {
             return 0;
         }
-        self.regs.get(byte_off / 4).copied().unwrap_or(0)
+        let wi = byte_off / 4;
+        // AI_STATUS read returns status bits, NOT the last written value.
+        // Per n64brew Audio_Interface:
+        //   bit 31 (0x80000000): AI_STATUS_DMA_BUSY — a DMA is currently in progress
+        //   bit 30 (0x40000000): AI_STATUS_FIFO_FULL — a second DMA is queued
+        // Real hardware has a 2-deep queue; we track only one (self.active), so
+        // FIFO_FULL should be 0 (we can always accept one more buffer).
+        if wi == AI_WORD_INDEX_STATUS {
+            // bit 31 = DMA_BUSY, bit 30 = FIFO_FULL. We track only one active
+            // playback, so FIFO_FULL is never set (game can always queue one
+            // more). BUSY is set while `self.active` holds a playback.
+            if self.active.is_some() {
+                return 0x8000_0000;
+            } else {
+                return 0;
+            }
+        }
+        // AI_LEN read returns remaining bytes of current buffer (0 when idle).
+        if wi == AI_WORD_INDEX_LEN {
+            // Without full remaining-bytes tracking, return 0 (idle) or a
+            // non-zero-but-arbitrary value while DMA is in flight. Most SM64
+            // code uses osAiGetLength for polling the "still playing" flag —
+            // returning the last written value during playback is close enough.
+            if self.active.is_some() {
+                return self.regs.get(wi).copied().unwrap_or(0);
+            } else {
+                return 0;
+            }
+        }
+        self.regs.get(wi).copied().unwrap_or(0)
     }
 
     pub fn write(&mut self, paddr: u32, value: u32, mi: &mut Mi) {
@@ -71,11 +106,25 @@ impl Ai {
             *r = value;
         }
         if wi == AI_WORD_INDEX_LEN && value != 0 {
+            static AI_LEN_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = AI_LEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 20 || n % 50 == 0 {
+                eprintln!("[AI_LEN W #{}] len=0x{:X} dram=0x{:08X}", n, value, self.regs[0]);
+            }
             mi.clear(MI_INTR_AI);
             let c = ai_pcm_buffer_cycles(value);
             self.active = Some(AiPlayback {
                 remaining_rcp_cycles: c.max(1),
             });
+        }
+        // Writing ANY value to AI_STATUS clears MI_INTR_AI (n64brew: Audio_Interface)
+        if wi == AI_WORD_INDEX_STATUS {
+            static AI_STATUS_W_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = AI_STATUS_W_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 20 || n % 50 == 0 {
+                eprintln!("[AI_STATUS W #{}] ack val=0x{:08X}", n, value);
+            }
+            mi.clear(MI_INTR_AI);
         }
     }
 
@@ -93,6 +142,11 @@ impl Ai {
                 return;
             }
             self.active = None;
+            static AI_RAISE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = AI_RAISE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 20 || n % 50 == 0 {
+                eprintln!("[AI IRQ raise #{}] buffer done", n);
+            }
             mi.raise(MI_INTR_AI);
         }
     }

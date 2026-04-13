@@ -20,10 +20,14 @@ pub const CART_ROM_TEST_DWORD_OFF: usize = 0x40;
 /// `PI_DRAM_ADDR` / `PI_CART_ADDR` / length registers ([n64brew: PI](https://n64brew.dev/wiki/Peripheral_Interface)).
 pub const PI_REG_DRAM_ADDR: u32 = 0x00;
 pub const PI_REG_CART_ADDR: u32 = 0x04;
-/// Cart → RDRAM DMA “read”; write starts transfer; read returns last written length − 1 (low 24 bits).
-pub const PI_REG_RD_LEN: u32 = 0x0C;
-/// RDRAM → cart DMA “write”; write starts transfer. **Read** at `0x10` is [`Pi::status`] (`PI_STATUS`).
-pub const PI_REG_WR_LEN: u32 = 0x10;
+/// RDRAM → Cart DMA (libultra `OS_WRITE`); named from PI's perspective (PI reads from RDRAM).
+/// Used for SRAM saves and similar cart write operations.
+pub const PI_REG_RD_LEN: u32 = 0x08;
+/// Cart → RDRAM DMA (libultra `OS_READ`); named from PI's perspective (PI writes to RDRAM).
+/// Games use this to load data from cart ROM into RDRAM.
+pub const PI_REG_WR_LEN: u32 = 0x0C;
+/// PI_STATUS: read returns status bits; write: bit0=reset controller, bit1=clear interrupt.
+pub const PI_REG_STATUS: u32 = 0x10;
 /// `PI_BSD_DOM1_LAT` — cart bus latency (cycles − 1 after address); affects DMA scheduling ([n64brew](https://n64brew.dev/wiki/Parallel_Interface)).
 pub const PI_REG_BSD_DOM1_LAT: u32 = 0x14;
 
@@ -116,7 +120,8 @@ impl Pi {
             PI_REG_DRAM_ADDR => self.dram_addr,
             PI_REG_CART_ADDR => self.cart_addr,
             PI_REG_RD_LEN => self.rd_len & 0x00FF_FFFF,
-            PI_REG_WR_LEN => self.status,
+            PI_REG_WR_LEN => self.wr_len & 0x00FF_FFFF,
+            PI_REG_STATUS => self.status,
             PI_REG_BSD_DOM1_LAT => self.bsd_dom1_lat as u32,
             _ => 0,
         }
@@ -127,15 +132,31 @@ impl Pi {
             return;
         };
         match off {
-            PI_REG_DRAM_ADDR => self.dram_addr = value,
-            PI_REG_CART_ADDR => self.cart_addr = value,
+            PI_REG_DRAM_ADDR => {
+                self.dram_addr = value;
+            }
+            PI_REG_CART_ADDR => {
+                self.cart_addr = value;
+            }
             PI_REG_RD_LEN => {
+                // 0x08: RDRAM → Cart (libultra OS_WRITE: save/write TO cart)
+                // Named from PI's perspective: PI reads FROM RDRAM
                 self.rd_len = value & 0x00FF_FFFF;
-                self.dma_read_kick(self.rd_len, mi);
+                self.dma_write_kick(self.rd_len, mi);
             }
             PI_REG_WR_LEN => {
+                // 0x0C: Cart → RDRAM (libultra OS_READ: load/read FROM cart)
+                // Named from PI's perspective: PI writes TO RDRAM
                 self.wr_len = value & 0x00FF_FFFF;
-                self.dma_write_kick(self.wr_len, mi);
+                self.dma_read_kick(self.wr_len, mi);
+            }
+            PI_REG_STATUS => {
+                // Bit 0: reset controller (not modeled)
+                // Bit 1: clear interrupt
+                if value & 2 != 0 {
+                    self.status &= !2; // clear interrupt flag
+                    mi.clear(MI_INTR_PI);
+                }
             }
             PI_REG_BSD_DOM1_LAT => self.bsd_dom1_lat = (value & 0xFF) as u8,
             _ => {}
@@ -165,6 +186,12 @@ impl Pi {
         let len = (len_minus_one as u64).saturating_add(1);
         if len == 0 {
             return;
+        }
+        static DMA_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = DMA_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 50 || (self.dram_addr >= 0x00360000 && self.dram_addr < 0x00380000) {
+            eprintln!("[PI] DMA Read #{}: Cart 0x{:08X} -> DRAM 0x{:08X}, {} bytes",
+                n, self.cart_addr, self.dram_addr, len);
         }
         mi.clear(MI_INTR_PI);
         self.status = (self.status & !2) | 1;
@@ -273,7 +300,9 @@ mod tests {
         pi.cart_addr = CART_DOM1_ADDR2_BASE + CART_ROM_TEST_DWORD_OFF as u32;
         pi.dram_addr = 0x0000_0000;
 
-        pi.write_reg(PI_REGS_BASE + PI_REG_RD_LEN, 3, &mut rdram, &mut mi);
+        // PI_WR_LEN triggers cart→RDRAM DMA (libultra OS_READ)
+        // Named from PI perspective: PI writes to RDRAM
+        pi.write_reg(PI_REGS_BASE + PI_REG_WR_LEN, 3, &mut rdram, &mut mi);
         assert!(pi.dma_busy());
         assert_ne!(rdram.read_u32(0).unwrap(), 0x8037_0012);
 
@@ -281,18 +310,19 @@ mod tests {
         assert!(!pi.dma_busy());
         assert_eq!(rdram.read_u32(0).unwrap(), 0x8037_0012);
         assert_ne!(mi.intr & MI_INTR_PI, 0);
-        assert_eq!(pi.read_reg(PI_REGS_BASE + PI_REG_RD_LEN), 3);
+        assert_eq!(pi.read_reg(PI_REGS_BASE + PI_REG_WR_LEN), 3);
     }
 
     #[test]
-    fn pi_rd_len_readback_after_dma() {
+    fn pi_wr_len_readback_after_dma() {
         let rom = vec![0xAAu8; 0x10];
         let mut pi = Pi::with_rom(rom);
         let mut rdram = PhysicalMemory::new(4 * 1024 * 1024);
         let mut mi = Mi::new();
         pi.cart_addr = CART_DOM1_ADDR2_BASE;
         pi.dram_addr = 0;
-        pi.write_reg(PI_REGS_BASE + PI_REG_RD_LEN, 0, &mut rdram, &mut mi);
-        assert_eq!(pi.read_reg(PI_REGS_BASE + PI_REG_RD_LEN), 0);
+        // PI_WR_LEN triggers cart→RDRAM DMA
+        pi.write_reg(PI_REGS_BASE + PI_REG_WR_LEN, 0, &mut rdram, &mut mi);
+        assert_eq!(pi.read_reg(PI_REGS_BASE + PI_REG_WR_LEN), 0);
     }
 }

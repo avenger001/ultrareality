@@ -81,6 +81,26 @@ pub fn blit_rgba5551(
     }
 }
 
+/// Interpret `tmem` as a row-major grid of big-endian RGBA5551 texels (`width * height * 2` bytes) and write RGBA8.
+pub fn tmem_rgba5551_grid_to_rgba8(tmem: &[u8], width: u32, height: u32, out: &mut [u8]) {
+    let w = width as usize;
+    let h = height as usize;
+    let need_t = w.saturating_mul(h).saturating_mul(2);
+    let need_o = w.saturating_mul(h).saturating_mul(4);
+    if need_t == 0 || tmem.len() < need_t || out.len() < need_o {
+        return;
+    }
+    for i in 0..w * h {
+        let p = u16::from_be_bytes([tmem[i * 2], tmem[i * 2 + 1]]);
+        let argb = pixel_rgba5551_to_argb(p);
+        let o = i * 4;
+        out[o] = (argb & 0xFF) as u8;
+        out[o + 1] = ((argb >> 8) & 0xFF) as u8;
+        out[o + 2] = ((argb >> 16) & 0xFF) as u8;
+        out[o + 3] = ((argb >> 24) & 0xFF) as u8;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +117,13 @@ mod tests {
         let mut out = [0u8; 4];
         blit_rgba5551_to_rgba8(&rd, 0, 1, 1, &mut out, 1, 1);
         assert_eq!(out, [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn tmem_grid_to_rgba8() {
+        let tm = [0xF8u8, 0x00, 0x07u8, 0xE0];
+        let mut out = [0u8; 2 * 4];
+        tmem_rgba5551_grid_to_rgba8(&tm, 2, 1, &mut out);
+        assert_ne!(out[0..4], out[4..8]);
     }
 }

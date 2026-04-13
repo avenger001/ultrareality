@@ -46,10 +46,20 @@ pub fn pi_cart_dma_total_cycles(byte_len: u64) -> u64 {
     byte_len.saturating_mul(PI_ROM_DMA_CYCLES_PER_BYTE)
 }
 
-// --- RDRAM (bus occupancy for RDP list DMA / VI fetch; no Rambus serial model) ---
+// --- RDRAM (bus occupancy for RDP list DMA / VI fetch; RI nibble tunes cost; no serial Rambus) ---
 
-/// RCP cycles billed per RDRAM byte for coarse bandwidth (VI blit, RDP list read/write stub).
-pub const RDRAM_BUS_CYCLES_PER_BYTE: u64 = 2;
+/// Base RCP cycles per RDRAM byte before `RI_LATENCY` nibble ([n64brew: RI](https://n64brew.dev/wiki/RDRAM_Interface)).
+pub const RDRAM_BUS_CYCLES_PER_BYTE_BASE: u64 = 2;
+
+/// Derive per-byte traffic cost from full `RI_LATENCY` register value (low nibble).
+#[inline]
+pub fn rdram_byte_cost_from_ri_latency(ri_latency_word: u32) -> u64 {
+    let n = (ri_latency_word & 0xF) as u64;
+    RDRAM_BUS_CYCLES_PER_BYTE_BASE.saturating_add(n / 8)
+}
+
+/// Default retail-style `RI_LATENCY` low nibble (`0xF`) → used when no bus is available.
+pub const RDRAM_BUS_CYCLES_PER_BYTE: u64 = RDRAM_BUS_CYCLES_PER_BYTE_BASE + (0xF_u64 / 8);
 
 // --- Serial Interface (SI), 64-byte PIF block -------------------------------
 
@@ -121,5 +131,12 @@ mod tests {
     #[test]
     fn sp_dma_four_bytes_includes_overhead() {
         assert!(sp_rsp_dma_total_cycles(3) >= 40);
+    }
+
+    #[test]
+    fn rdram_byte_cost_tracks_ri_latency_nibble() {
+        assert_eq!(rdram_byte_cost_from_ri_latency(0x0000_000F), 3);
+        assert_eq!(RDRAM_BUS_CYCLES_PER_BYTE, 3);
+        assert_eq!(rdram_byte_cost_from_ri_latency(0), RDRAM_BUS_CYCLES_PER_BYTE_BASE);
     }
 }

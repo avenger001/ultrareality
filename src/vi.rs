@@ -49,7 +49,7 @@ pub const VI_NTSC_CYCLES_PER_FRAME: u64 = crate::timing::VI_NTSC_CYCLES_PER_FRAM
 /// Stub: treat a frame as [`crate::timing::VI_NTSC_ACTIVE_SCANLINES`] lines for `VI_V_CURRENT` scaling.
 pub const VI_NTSC_SCANLINES: u64 = crate::timing::VI_NTSC_ACTIVE_SCANLINES;
 
-/// RDRAM cycles charged per byte for VI framebuffer readout ([`crate::timing::RDRAM_BUS_CYCLES_PER_BYTE`]).
+/// Default RDRAM cycles per byte for VI fetch ([`crate::timing::RDRAM_BUS_CYCLES_PER_BYTE`]).
 pub const VI_RDRAM_CYCLES_PER_BYTE: u64 = crate::timing::RDRAM_BUS_CYCLES_PER_BYTE;
 
 #[derive(Debug)]
@@ -64,6 +64,11 @@ pub struct Vi {
     /// Avoid re-raising `MI_INTR_VI` for the same `VI_V_INTR` line crossing within one field.
     v_line_intr_latched: bool,
 }
+
+/// Diagnostic counter: total times MI_INTR_VI was raised by vi.advance.
+pub static VI_INT_RAISE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Diagnostic counter: times VI_V_CURRENT was written (VI interrupt ack).
+pub static VI_INT_ACK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Vi {
     pub fn new() -> Self {
@@ -88,18 +93,19 @@ impl Vi {
     }
 
     /// Schedule RDRAM bandwidth cost for reading `pixels` RGBA5551 texels (2 bytes each) for display.
-    pub fn charge_framebuffer_fetch_rgba16_pixels(&mut self, pixels: u64) {
+    pub fn charge_framebuffer_fetch_rgba16_pixels(&mut self, pixels: u64, cycles_per_byte: u64) {
         let bytes = pixels.saturating_mul(2);
         self.fetch_debt = self
             .fetch_debt
-            .saturating_add(bytes.saturating_mul(VI_RDRAM_CYCLES_PER_BYTE));
+            .saturating_add(bytes.saturating_mul(cycles_per_byte));
     }
 
     pub fn drain_fetch_debt(&mut self) -> u64 {
         std::mem::take(&mut self.fetch_debt)
     }
 
-    /// Add retired cycles; optional mid-field interrupt from `VI_V_INTR`, then field `MI_INTR_VI` at frame end.
+    /// Add retired cycles; VI interrupt fires when `VI_V_CURRENT` crosses `VI_V_INTR`.
+    /// Frame counter increments at end of field (no separate interrupt at frame wrap).
     pub fn advance(&mut self, cycles: u64, mi: &mut Mi) {
         let start = self.cycle_in_frame;
         let end = start.saturating_add(cycles);
@@ -107,6 +113,7 @@ impl Vi {
             if !self.v_line_intr_latched && start < t && end >= t {
                 self.v_line_intr_latched = true;
                 mi.raise(MI_INTR_VI);
+                VI_INT_RAISE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         self.cycle_in_frame = end;
@@ -114,7 +121,7 @@ impl Vi {
             self.cycle_in_frame -= VI_NTSC_CYCLES_PER_FRAME;
             self.frame_counter = self.frame_counter.wrapping_add(1);
             self.v_line_intr_latched = false;
-            mi.raise(MI_INTR_VI);
+            // Note: VI interrupt only fires at VI_V_INTR line, not at frame wrap
         }
     }
 
@@ -158,6 +165,16 @@ impl Vi {
         let i = byte_off / 4;
         if i == VI_REG_V_CURRENT {
             return;
+        }
+        // Log first few VI_ORIGIN writes
+        if i == VI_REG_ORIGIN {
+            static VI_ORIGIN_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = VI_ORIGIN_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let old_val = self.regs.get(i).copied().unwrap_or(0);
+            if n < 20 || (value != old_val && n < 100) {
+                eprintln!("[VI_ORIGIN #{} write] frame={} old=0x{:08X} new=0x{:08X}",
+                    n, self.frame_counter, old_val, value);
+            }
         }
         if let Some(r) = self.regs.get_mut(i) {
             *r = value;
@@ -204,6 +221,8 @@ mod tests {
         let mut vi = Vi::new();
         let mut mi = Mi::new();
         mi.mask = MI_INTR_VI;
+        // V_INTR must be non-zero for interrupt to fire (0 disables it)
+        vi.regs[VI_REG_V_INTR] = 128; // Set interrupt at scanline 128
         vi.advance(VI_NTSC_CYCLES_PER_FRAME, &mut mi);
         assert!(mi.cpu_irq_pending());
     }

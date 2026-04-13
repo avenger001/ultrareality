@@ -98,6 +98,7 @@ impl Si {
         let Some(off) = Self::offset(paddr) else {
             return;
         };
+
         match off {
             SI_REG_DRAM_ADDR => self.dram_addr = value,
             SI_REG_PIF_ADDR_RD64B => {
@@ -108,11 +109,21 @@ impl Si {
                 self.pif_addr_wr = value;
                 self.dma_wr64_kick(value, mi);
             }
+            SI_REG_STATUS => {
+                // Any write to SI_STATUS clears the interrupt bit and acks MI_INTR_SI.
+                self.status &= !4;
+                mi.clear(MI_INTR_SI);
+            }
             _ => {}
         }
     }
 
     fn dma_rd64_kick(&mut self, pif_addr: u32, mi: &mut Mi) {
+        static SI_RD64_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SI_RD64_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 30 {
+            eprintln!("[SI RD64B #{}] dram=0x{:08X} pif=0x{:08X}", n, self.dram_addr, pif_addr);
+        }
         mi.clear(MI_INTR_SI);
         self.status = (self.status & !4) | 3;
         self.active = Some(SiDmaActive {
@@ -124,6 +135,11 @@ impl Si {
     }
 
     fn dma_wr64_kick(&mut self, pif_addr: u32, mi: &mut Mi) {
+        static SI_WR64_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SI_WR64_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 30 {
+            eprintln!("[SI WR64B #{}] dram=0x{:08X} pif=0x{:08X}", n, self.dram_addr, pif_addr);
+        }
         mi.clear(MI_INTR_SI);
         self.status = (self.status & !4) | 3;
         self.active = Some(SiDmaActive {
@@ -183,6 +199,8 @@ impl Si {
                     };
                     pif.ram[op.pif_base.wrapping_add(i) & (PIF_RAM_LEN - 1)] = b;
                 }
+                // Process Joybus commands after CPU writes to PIF RAM
+                pif.process_commands();
             }
         }
         self.status = (self.status & !3) | 4;
