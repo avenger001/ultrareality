@@ -354,11 +354,37 @@ pub fn step_instruction(bus: &mut SystemBus) -> u64 {
             HANDLER_TRACE_REMAINING.store(r - 1, std::sync::atomic::Ordering::Relaxed);
             let iw_trace = imem_load_word(&bus.rsp_imem, pc);
             let tag = HANDLER_TRACE_TAG.load(std::sync::atomic::Ordering::Relaxed);
-            eprintln!("[HTRACE t={} rem={}] pc=0x{:03X} iw=0x{:08X} op=0x{:02X} t9=0x{:08X} t8=0x{:08X} at=0x{:08X} v0=0x{:08X} a1=0x{:08X} k1=0x{:04X}",
+            eprintln!("[HTRACE t={} rem={}] pc=0x{:03X} iw=0x{:08X} op=0x{:02X} t9=0x{:08X} t8=0x{:08X} at=0x{:08X} v0=0x{:08X} v1=0x{:08X} t3=0x{:08X} t4=0x{:08X} t0=0x{:08X} t1=0x{:08X} k1=0x{:04X}",
                 tag, r, pc, iw_trace, iw_trace >> 26,
                 bus.rsp_scalar_regs[25] as u32, bus.rsp_scalar_regs[24] as u32,
                 bus.rsp_scalar_regs[1] as u32, bus.rsp_scalar_regs[2] as u32,
-                bus.rsp_scalar_regs[5] as u32, bus.rsp_scalar_regs[27] as u32 & 0xFFF);
+                bus.rsp_scalar_regs[3] as u32,
+                bus.rsp_scalar_regs[11] as u32, bus.rsp_scalar_regs[12] as u32,
+                bus.rsp_scalar_regs[8] as u32, bus.rsp_scalar_regs[9] as u32,
+                bus.rsp_scalar_regs[27] as u32 & 0xFFF);
+            // At the G_TRI1 cull-test point (pc=0x9B0), snapshot the three
+            // vertex outcode bytes + first 8 bytes of each vertex record.
+            if pc == 0x9B0 {
+                let at = bus.rsp_scalar_regs[1] as u32 as usize & 0xFFF;
+                let v0 = bus.rsp_scalar_regs[2] as u32 as usize & 0xFFF;
+                let v1 = bus.rsp_scalar_regs[3] as u32 as usize & 0xFFF;
+                let read_u16 = |off: usize| -> u16 {
+                    if off + 2 <= bus.rsp_dmem.len() {
+                        u16::from_be_bytes([bus.rsp_dmem[off], bus.rsp_dmem[off+1]])
+                    } else { 0 }
+                };
+                let read_bytes = |off: usize, n: usize| -> String {
+                    (0..n).map(|i| {
+                        if off + i < bus.rsp_dmem.len() {
+                            format!("{:02X}", bus.rsp_dmem[off + i])
+                        } else { "??".into() }
+                    }).collect::<Vec<_>>().join("")
+                };
+                eprintln!("[CULL v0@{:03X} flag24={:04X} bytes={}] [v1@{:03X} flag24={:04X} bytes={}] [v2@{:03X} flag24={:04X} bytes={}]",
+                    at, read_u16(at + 0x24), read_bytes(at, 40),
+                    v0, read_u16(v0 + 0x24), read_bytes(v0, 40),
+                    v1, read_u16(v1 + 0x24), read_bytes(v1, 40));
+            }
         }
     }
     // DL command log: every time the ucode reads a DL command at 0x060
@@ -433,6 +459,19 @@ pub fn step_instruction(bus: &mut SystemBus) -> u64 {
             eprintln!("[HT ARM G_VTX] DL#{} cmd={:08X} addr={:08X}", n, w0, w1);
             HANDLER_TRACE_TAG.store(0x04000000, std::sync::atomic::Ordering::Relaxed);
             HANDLER_TRACE_ARM.store(300, std::sync::atomic::Ordering::Relaxed);
+        }
+        // G_TRI1 (op 0xBF) — trace the triangle setup/emission handler.
+        // This is where the "no triangles reach RDP" bug lives. We want
+        // to see: transform, clip/cull test, cross-product setup,
+        // edge coefficient computation, and SB/SH writes to the RDP
+        // output buffer in DMEM.
+        static HT_ARMED_GTRI1: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if (w0 >> 24) == 0xBF
+           && !HT_ARMED_GTRI1.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!("[HT ARM G_TRI1] DL#{} cmd={:08X} indices={:08X}", n, w0, w1);
+            HANDLER_TRACE_TAG.store(0xBF000000, std::sync::atomic::Ordering::Relaxed);
+            HANDLER_TRACE_ARM.store(800, std::sync::atomic::Ordering::Relaxed);
         }
         // First time we see a NOOP in a stuck task (after task #310's break),
         // dump the entire ring buffer + segment table area so we can see what's there.
