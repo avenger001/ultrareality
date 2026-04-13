@@ -423,6 +423,17 @@ pub fn step_instruction(bus: &mut SystemBus) -> u64 {
             HANDLER_TRACE_TAG.store(0xB8000000, std::sync::atomic::Ordering::Relaxed);
             HANDLER_TRACE_ARM.store(80, std::sync::atomic::Ordering::Relaxed);
         }
+        // G_VTX (op 0x04) — trace the vertex load handler. This is the
+        // key path we need to verify: does it segment-resolve, kick an
+        // SP DMA, and land the vertices in the vertex cache?
+        static HT_ARMED_GVTX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if (w0 >> 24) == 0x04
+           && !HT_ARMED_GVTX.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!("[HT ARM G_VTX] DL#{} cmd={:08X} addr={:08X}", n, w0, w1);
+            HANDLER_TRACE_TAG.store(0x04000000, std::sync::atomic::Ordering::Relaxed);
+            HANDLER_TRACE_ARM.store(300, std::sync::atomic::Ordering::Relaxed);
+        }
         // First time we see a NOOP in a stuck task (after task #310's break),
         // dump the entire ring buffer + segment table area so we can see what's there.
         if w0 == 0 && w1 == 0 && n > 200
@@ -603,7 +614,22 @@ pub fn step_instruction(bus: &mut SystemBus) -> u64 {
                                 }
                             })
                             .collect();
-                        eprintln!("[RSP] GFX-BREAK #{} DMEM[400..580] (vtx cache):{}", g, vtx.join(" "));
+                        eprintln!("[RSP] GFX-BREAK #{} DMEM[400..580] (vtx cache?):{}", g, vtx.join(" "));
+                        // Also try 0x800..0xC00 — some F3D variants place
+                        // the vertex cache here (between RDP output FIFO
+                        // and scratch area).
+                        let vtx2: Vec<String> = bus.rsp_dmem[0x800..0xC00]
+                            .chunks(4)
+                            .enumerate()
+                            .map(|(i, c)| {
+                                if i % 8 == 0 {
+                                    format!("\n  {:03X}: {:02X}{:02X}{:02X}{:02X}", 0x800 + i * 4, c[0], c[1], c[2], c[3])
+                                } else {
+                                    format!("{:02X}{:02X}{:02X}{:02X}", c[0], c[1], c[2], c[3])
+                                }
+                            })
+                            .collect();
+                        eprintln!("[RSP] GFX-BREAK #{} DMEM[800..C00]:{}", g, vtx2.join(" "));
                     }
                 } else {
                     let a = AUD_BREAK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
