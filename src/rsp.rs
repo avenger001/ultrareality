@@ -620,6 +620,20 @@ pub fn step_instruction(bus: &mut SystemBus) -> u64 {
                             })
                             .collect();
                         eprintln!("[RSP] GFX-BREAK #{} IMEM[000..100]:{}", g, dump.join(" "));
+                    }
+                    // At first GFX-BREAK, dump the full F3D IMEM so we can
+                    // disassemble the cull path (0x900..0xA00) and the
+                    // transform path (0x200..0x400) while the microcode is
+                    // still loaded. End-of-run FINAL IMEM dump shows AUDIO
+                    // ucode because audio tasks run last.
+                    if g == 0 {
+                        for base in (0x000..0x1000).step_by(0x40) {
+                            let line: Vec<String> = (0..0x40).step_by(4).map(|i| {
+                                let c = &bus.rsp_imem[base + i..base + i + 4];
+                                format!("{:08X}", u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+                            }).collect();
+                            eprintln!("[RSP] F3D IMEM[{:03X}]: {}", base, line.join(" "));
+                        }
                         // Also dump the dispatch table area DMEM[0x0B0..0x180]
                         // — Fast3D reads LH $v0, 0xBC($at) from here.
                         let dmem: Vec<String> = bus.rsp_dmem[0x0B0..0x180]

@@ -618,7 +618,16 @@ impl VectorUnit {
         self.vco = 0;
     }
 
-    /// VCH: vector clip half (sets VCC, VCO, VCE for subsequent VCL/VCR)
+    /// VCH: vector clip half (sets VCC, VCO, VCE for subsequent VCL).
+    /// Canonical semantics (cross-referenced with Angrylion/cen64):
+    ///
+    /// different signs (s^t < 0):  vcc_lo = (s+t <= 0); vcc_hi = (t < 0);
+    ///                              vco_sign = 1; vco_ne = (s+t != 0 && s+t != -1);
+    ///                              vce = (s+t == -1);
+    ///                              acc_lo = vcc_lo ? ~t : s
+    /// same signs:                  vcc_lo = (t < 0);    vcc_hi = (s - t >= 0);
+    ///                              vco_sign = 0; vco_ne = (s != t); vce = 0;
+    ///                              acc_lo = vcc_hi ? t : s
     pub fn vch(&mut self, vd: usize, vs: usize, vt_broadcast: &Vreg) {
         self.vcc = 0;
         self.vco = 0;
@@ -627,37 +636,38 @@ impl VectorUnit {
             let s = self.vr[vs][i] as i16;
             let t = vt_broadcast[i] as i16;
             if (s ^ t) < 0 {
-                // Different signs
+                // Different signs: clip against (-t..+t) via s + t
                 let sum = s.wrapping_add(t);
                 let le = sum <= 0;
                 if le {
-                    self.vcc |= 1 << i; // clip low
+                    self.vcc |= 1 << i; // vcc_lo
                 }
-                let ge = (-t as i32) <= (s as i32);
-                if ge {
-                    self.vcc |= 1 << (i + 8); // clip high
+                if t < 0 {
+                    self.vcc |= 1 << (i + 8); // vcc_hi = (t < 0)
                 }
-                if sum == -1 {
+                let ce = sum == -1;
+                if ce {
                     self.vce |= 1 << i;
                 }
-                self.vco |= 1 << i; // sign bit
-                self.vco |= 1 << (i + 8); // ne
+                self.vco |= 1 << i; // sign flag
+                if sum != 0 && !ce {
+                    self.vco |= 1 << (i + 8); // ne flag
+                }
                 self.vr[vd][i] = if le { (!t) as u16 } else { self.vr[vs][i] };
             } else {
                 // Same sign
                 let diff = s.wrapping_sub(t);
                 let ge = diff >= 0;
-                if ge {
-                    self.vcc |= 1 << (i + 8);
+                if t < 0 {
+                    self.vcc |= 1 << i; // vcc_lo = (t < 0)
                 }
-                let le = (s as i32) <= (t as i32);
-                if le {
-                    self.vcc |= 1 << i;
+                if ge {
+                    self.vcc |= 1 << (i + 8); // vcc_hi = (s >= t)
                 }
                 if diff != 0 {
-                    self.vco |= 1 << (i + 8);
+                    self.vco |= 1 << (i + 8); // ne flag (sign flag stays 0)
                 }
-                self.vr[vd][i] = if ge { self.vr[vs][i] } else { vt_broadcast[i] };
+                self.vr[vd][i] = if ge { vt_broadcast[i] } else { self.vr[vs][i] };
             }
             self.acc_lo[i] = self.vr[vd][i];
         }
@@ -1164,8 +1174,11 @@ pub fn execute_cop2(vu: &mut VectorUnit, scalar_regs: &mut [u32; 32], _dmem: &mu
                 0x21 => vu.veq(vd, vs, &vt_b),
                 0x22 => vu.vne(vd, vs, &vt_b),
                 0x23 => vu.vge(vd, vs, &vt_b),
-                0x24 => vu.vch(vd, vs, &vt_b),
-                0x25 => vu.vcl(vd, vs, &vt_b),
+                // Canonical RSP funct encoding: VCL=0x24, VCH=0x25.
+                // VCH is the first-pass clip test (sets VCC/VCO/VCE);
+                // VCL is the second-pass that consumes that state.
+                0x24 => vu.vcl(vd, vs, &vt_b),
+                0x25 => vu.vch(vd, vs, &vt_b),
                 0x26 => vu.vcr(vd, vs, &vt_b),
                 0x27 => vu.vmrg(vd, vs, &vt_b),
 
